@@ -1,167 +1,247 @@
-import io, json
+# streamlit_app.py
+import re, io, json
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import pulp as pl
 
-st.set_page_config(page_title="MSW DSS — Türkiye", page_icon="♻️", layout="wide")
+# sklearn imputer
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.experimental import enable_iterative_imputer  # noqa: F401
+from sklearn.impute import IterativeImputer
 
-# -------------------- Helper / Defaults --------------------
-DEFAULT_PRESETS = {
-    "Baseline": dict(
-        recycle_target=0.45, min_treat_share=0.10, max_landfill_share=0.60,
-        growth_multiplier=1.00, uncertainty_pct=0.00, carbon_price=10.0
-    ),
-    "Green": dict(
-        recycle_target=0.85, min_treat_share=0.15, max_landfill_share=0.05,
-        growth_multiplier=1.00, uncertainty_pct=0.10, carbon_price=100.0
-    ),
-    "Budget": dict(
-        recycle_target=0.30, min_treat_share=0.10, max_landfill_share=0.60,
-        growth_multiplier=1.00, uncertainty_pct=0.05, carbon_price=0.0
-    )
-}
+st.set_page_config(page_title="MSW DSS — Türkiye (RF + DSS v3)", page_icon="♻️", layout="wide")
 
-# Kapasiteler (ton/yıl) — örnek kalibrasyon (geri dönüşüm ~80k/tesis, arıtma ~320k/tesis)
-PER_FACILITY_CAP = {"landfill": 1_000_000, "recycle": 80_000, "treatment": 320_000}
-FACILITY_LEAD_TIME_YEARS = {"landfill": 0, "recycle": 1, "treatment": 1}
+# =========================
+# Utilities & Defaults
+# =========================
+def _clean_decimal_series(s):
+    # "30,13" -> 30.13; boş->NaN
+    return pd.to_numeric(s.astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
-# Maliyetler
-ANNUALIZED_CAPEX_MUSD = {"landfill": 5.0, "recycle": 3.0, "treatment": 12.0}  # M$ / tesis-yıl
-OPEX_USD_PER_TON     = {"landfill": 30.0, "recycle": 32.0, "treatment": 40.0} # $/ton
-DISCOUNT_RATE = 0.08
+def safe_float(x, default=0.0):
+    try:
+        v = float(x)
+        return v if np.isfinite(v) else default
+    except Exception:
+        return default
 
-# Emisyon faktörleri (kgCO2e/ton) — isterseniz yan panelden değiştirebilirsiniz
-EMISSION_FACTORS = {"landfill": 480.0, "recycle": 60.0, "treatment": 200.0}
-
-# Başlangıç payları ve başlık boşluğu (veride kapasite yoksa kullanılır)
-BASELINE_SHARES = {"landfill": 0.65, "recycle": 0.25, "treatment": 0.10}
-BASELINE_HEADROOM = 1.05
-
-# Slack cezaları ($/ton) — yatırım yerine ceza ödemesini caydırır
-SLACK_PENALTIES = {
-    "unserved_waste": 1000,
-    "recycle_deficit": 300,
-    "treat_deficit": 300,
-    "landfill_excess": 100,
-}
-
-USE_INTEGER_FACILITIES = False     # integer isterseniz True yapın
-CAPACITY_ANCHOR = "last_data"      # ya da bir yıl (int)
-
-# -------------------- Data I/O --------------------
-ST_SAMPLE_DF = pd.DataFrame({
-    "region": ["National", "National", "National"],
+# Örnek ulusal veri (yüklenmezse)
+SAMPLE_DF = pd.DataFrame({
+    "region": ["National"]*3,
     "year":   [2020, 2021, 2022],
-    # Aşağıdaki iki kolondan biri yeterli:
-    "waste_collected_ton_per_year": [30_000_000, np.nan, 30_283_760],
+    "waste_collected_ton_per_year": [30_000_000, 29_455_750, 30_283_760],
     "waste_generated_ton_per_year": [32_000_000, 33_940_700, 31_797_940],
-    # Kapasiteler varsa daha doğru başlar:
     "landfill_capacity_ton":  [23_848_460, np.nan, np.nan],
     "recycle_capacity_ton":   [4_769_692,  np.nan, np.nan],
     "treatment_capacity_ton": [3_179_794,  np.nan, np.nan],
 })
 
-def read_input_df(uploaded):
-    if uploaded is None:
-        return ST_SAMPLE_DF.copy()
-    ext = uploaded.name.lower().split(".")[-1]
+# =========================
+# A) Facility table: read + RF imputation
+# =========================
+def normalize_cols(df):
+    def norm(c):
+        s = c.lower()
+        s = (s.replace("ı","i").replace("ğ","g").replace("ü","u")
+               .replace("ş","s").replace("ö","o").replace("ç","c"))
+        s = re.sub(r"\s+", " ", s).strip()
+        return s
+    return df.rename(columns={c: norm(c) for c in df.columns})
+
+def load_facility_table(file):
+    if file is None:
+        return None
+    ext = file.name.lower().split(".")[-1]
     if ext in ("xlsx","xls"):
-        df = pd.read_excel(uploaded)
-    elif ext in ("csv",):
-        df = pd.read_csv(uploaded)
+        raw = pd.read_excel(file)
+    elif ext=="csv":
+        raw = pd.read_csv(file)
     else:
-        st.error("Desteklenen formatlar: .xlsx, .xls, .csv")
+        st.error("Tesis tablosu: .xlsx/.xls/.csv yükleyin.")
         st.stop()
-    return df
+    raw = normalize_cols(raw)
+    # yıl kolonu yoksa ilk kolonu year yap
+    if "year" not in raw.columns:
+        raw = raw.rename(columns={raw.columns[0]: "year"})
+    raw["year"] = pd.to_numeric(raw["year"], errors="coerce").astype("Int64")
 
-# -------------------- Core Solver --------------------
-def solve_multiyear_scenario(df, scenario_name, sp, years):
-    """Slack'li tek amaç: NPV maliyet + karbon maliyeti. 5 output döner."""
-    VERSION_TAG = "v2-slack-5ret"
+    colmap = {
+        "kompost tesisi (tesis sayisi)": "compost_facilities",
+        "beraber yakma (ko-insinerasyon) tesisi (tesis sayisi)": "coincin_facilities",
+        "diger geri kazanim tesisleri (tesis sayisi)": "recovery_facilities",
+        "kompost tesisi (islenen atik miktari)": "compost_processed_ton",
+        "beraber yakma (ko-insinerasyon) tesisi (islenen atik miktari)": "coincin_processed_ton",
+        "diger geri kazanim tesisleri (islenen atik miktari)": "recovery_processed_ton",
+        "geri donusum oranlari (%)": "recycle_rate_pct",
+        "eu geri donusum hedefleri (%)": "eu_recycle_target_pct",
+    }
+    for k,v in colmap.items():
+        if k in raw.columns: raw.rename(columns={k:v}, inplace=True)
+
+    keep = ["year"] + list(colmap.values())
+    dfF = raw[[c for c in keep if c in raw.columns]].copy()
+
+    # numerik dönüşüm
+    for c in dfF.columns:
+        if c == "year": continue
+        dfF[c] = _clean_decimal_series(dfF[c])
+
+    # lag özellikleri
+    dfF = dfF.sort_values("year")
+    num_cols = [c for c in dfF.columns if c!="year"]
+    for c in num_cols:
+        dfF[f"{c}_lag1"] = dfF[c].shift(1)
+
+    # RF imputation
+    rf = RandomForestRegressor(n_estimators=600, random_state=42, n_jobs=-1)
+    imputer = IterativeImputer(estimator=rf, random_state=42, max_iter=20)
+    imputed = dfF.copy()
+    imp_cols = num_cols + [c for c in dfF.columns if c.endswith("_lag1")]
+    imputed[imp_cols] = imputer.fit_transform(imputed[imp_cols])
+
+    # tesis sayıları tamsayı ve >=0
+    for c in ["compost_facilities","coincin_facilities","recovery_facilities"]:
+        if c in imputed.columns:
+            imputed[c] = np.clip(np.round(imputed[c]), 0, None).astype(int)
+
+    # lagları temizle
+    imputed.drop(columns=[c for c in imputed.columns if c.endswith("_lag1")], inplace=True, errors="ignore")
+    return imputed
+
+# =========================
+# B) Year-by-year base capacity + per-facility capacity
+# =========================
+def capacities_by_year_from_facility(dfF):
+    """
+    Döner:
+      base_caps_by_year: {year: {'recycle': cap_ton, 'treatment': cap_ton}}
+      per_fac: {'recycle': ton/y, 'treatment': ton/y}  (median)
+    """
+    dfF = dfF.sort_values("year").reset_index(drop=True)
+
+    def safe_ratio(num, den):
+        num = pd.to_numeric(num, errors="coerce")
+        den = pd.to_numeric(den, errors="coerce").replace(0, np.nan)
+        return num / den
+
+    rec_perfac = safe_ratio(dfF.get("recovery_processed_ton"), dfF.get("recovery_facilities"))
+    trt_processed = (pd.to_numeric(dfF.get("compost_processed_ton"), errors="coerce").fillna(0) +
+                     pd.to_numeric(dfF.get("coincin_processed_ton"), errors="coerce").fillna(0))
+    trt_facilities = (pd.to_numeric(dfF.get("compost_facilities"), errors="coerce").fillna(0) +
+                      pd.to_numeric(dfF.get("coincin_facilities"), errors="coerce").fillna(0))
+    trt_perfac = safe_ratio(trt_processed, trt_facilities)
+
+    def clip_1_99(s):
+        s = s.dropna()
+        if s.empty: return s
+        q1,q99 = np.nanpercentile(s, [1,99])
+        return s.clip(q1,q99)
+
+    rec_perfac = clip_1_99(rec_perfac).reindex(dfF.index).interpolate("linear", limit_direction="both")
+    trt_perfac = clip_1_99(trt_perfac).reindex(dfF.index).interpolate("linear", limit_direction="both")
+
+    base_caps = {}
+    for i,row in dfF.iterrows():
+        y = int(row["year"])
+        n_rec = float(row.get("recovery_facilities", 0) or 0)
+        n_trt = float((row.get("compost_facilities",0) or 0) + (row.get("coincin_facilities",0) or 0))
+        base_caps[y] = {
+            "recycle":   float(n_rec * (rec_perfac.iloc[i] if pd.notna(rec_perfac.iloc[i]) else 0.0)),
+            "treatment": float(n_trt * (trt_perfac.iloc[i] if pd.notna(trt_perfac.iloc[i]) else 0.0))
+        }
+
+    per_fac = {
+        "recycle":   float(np.nanmedian(rec_perfac)),
+        "treatment": float(np.nanmedian(trt_perfac))
+    }
+    return base_caps, per_fac
+
+def build_target_series_from_facility(dfF):
+    if dfF is None or "eu_recycle_target_pct" not in dfF.columns:
+        return None
+    t = dfF[["year","eu_recycle_target_pct"]].dropna()
+    if t.empty: return None
+    t["eu_recycle_target_pct"] = pd.to_numeric(t["eu_recycle_target_pct"], errors="coerce")/100.0
+    t = t.set_index("year")["eu_recycle_target_pct"].sort_index()
+    t = t.interpolate("linear", limit_direction="both")
+    return {int(k): float(v) for k,v in t.items()}
+
+# =========================
+# C) DSS v3 (share caps + overshoot + ramp + lead-times)
+# =========================
+def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
+                          target_by_year=None,
+                          per_fac_override=None,
+                          base_caps_by_year=None,
+                          landfill_share_for_base=0.65,
+                          ramp_limits=True,
+                          max_new_per_year={"recycle":10, "treatment":22, "landfill":0},
+                          share_caps={"recycle_max":0.85, "treat_max":0.35, "landfill_min":0.02},
+                          target_band_up=0.02,
+                          extra_penalties={"recycle_overshoot":600, "treat_overshoot":10, "landfill_under":150},
+                          lead_times=None):
     regions = ["National"]
-    data_minY, data_maxY = int(df["year"].min()), int(df["year"].max())
+    data_minY, data_maxY = int(df_main["year"].min()), int(df_main["year"].max())
 
-    def safe(x, default=0.0):
-        try:
-            v=float(x)
-            return v if np.isfinite(v) else default
-        except Exception:
-            return default
-
+    # Demand projection
     def last_valid_before_or_equal(y, r):
         for yy in range(min(y, data_maxY), data_minY-1, -1):
-            sub = df[(df["year"]==yy)&(df["region"]==r)]
+            sub = df_main[(df_main["year"]==yy)&(df_main["region"]==r)]
             if not sub.empty:
                 for col in ["waste_collected_ton_per_year","waste_generated_ton_per_year"]:
                     if col in sub.columns and sub[col].notna().any():
-                        v=safe(sub[col].iloc[0], np.nan)
-                        if np.isfinite(v): return v
+                        vv = safe_float(sub[col].iloc[0], np.nan)
+                        if np.isfinite(vv): return vv
         return np.nan
-
     def first_valid_at_or_after(y, r):
         for yy in range(max(y, data_minY), data_maxY+1):
-            sub = df[(df["year"]==yy)&(df["region"]==r)]
+            sub = df_main[(df_main["year"]==yy)&(df_main["region"]==r)]
             if not sub.empty:
                 for col in ["waste_collected_ton_per_year","waste_generated_ton_per_year"]:
                     if col in sub.columns and sub[col].notna().any():
-                        v=safe(sub[col].iloc[0], np.nan)
-                        if np.isfinite(v): return v
+                        vv = safe_float(sub[col].iloc[0], np.nan)
+                        if np.isfinite(vv): return vv
         return np.nan
 
-    # Talep
-    W_expected = {}
+    W_expected={}
     for r in regions:
         ref_last = last_valid_before_or_equal(data_maxY, r)
         if not np.isfinite(ref_last): ref_last = 0.0
-        for y in years:
+        for y in YEARS:
             if y < data_minY:
                 base = first_valid_at_or_after(data_minY, r); base = 0.0 if not np.isfinite(base) else base
-                W_expected[(r,y)] = base
             elif y <= data_maxY:
                 base = last_valid_before_or_equal(y, r)
                 if not np.isfinite(base): base = first_valid_at_or_after(y, r)
                 base = 0.0 if not np.isfinite(base) else base
-                W_expected[(r,y)] = base * sp["growth_multiplier"]
+                base *= sp["growth_multiplier"]
             else:
                 delta = y - data_maxY
-                W_expected[(r,y)] = ref_last * (sp["growth_multiplier"] ** delta)
-    W_use = {(r,y): safe(W_expected[(r,y)]*(1.0+sp.get("uncertainty_pct",0.0)),0.0)
-             for r in regions for y in years}
+                base = ref_last * (sp["growth_multiplier"] ** delta)
+            W_expected[(r,y)] = base
+    W_use = {(r,y): safe_float(W_expected[(r,y)]*(1.0+sp.get("uncertainty_pct",0.0)),0.0) for r in regions for y in YEARS}
 
-    # Kapasite ankoru
-    if CAPACITY_ANCHOR == "last_data": anchor_year = data_maxY
-    elif isinstance(CAPACITY_ANCHOR, int): anchor_year = int(CAPACITY_ANCHOR)
-    else: anchor_year = data_maxY
+    # Base capacities per year
+    def base_caps_func(y):
+        if base_caps_by_year and y in base_caps_by_year:
+            Rcap = float(base_caps_by_year[y].get("recycle",0.0) or 0.0)
+            Tcap = float(base_caps_by_year[y].get("treatment",0.0) or 0.0)
+        else:
+            Wa = np.mean([W_use[(regions[0],yy)] for yy in YEARS]) if YEARS else 0.0
+            Rcap = Wa*(1-landfill_share_for_base)*0.7
+            Tcap = Wa*(1-landfill_share_for_base)*0.3
+        Wa_y = W_use[(regions[0], y)]
+        Lcap = max(Wa_y*landfill_share_for_base*1.05, 0.0)
+        return Lcap, Rcap, Tcap
 
-    def anchor_caps_for_region(r):
-        sub = df[(df["region"]==r) & (df["year"]==anchor_year)]
-        if not sub.empty and {"landfill_capacity_ton","recycle_capacity_ton","treatment_capacity_ton"}.issubset(sub.columns):
-            L = safe(sub["landfill_capacity_ton"].iloc[0], np.nan)
-            R = safe(sub["recycle_capacity_ton"].iloc[0], np.nan)
-            T = safe(sub["treatment_capacity_ton"].iloc[0], np.nan)
-            if np.isfinite(L) and np.isfinite(R) and np.isfinite(T) and (L+R+T)>0:
-                return L,R,T
-        W_anchor = safe(W_expected[(r, min(max(anchor_year, years[0]), years[-1]))], 0.0)
-        return (W_anchor*BASELINE_SHARES["landfill"]*BASELINE_HEADROOM,
-                W_anchor*BASELINE_SHARES["recycle"] *BASELINE_HEADROOM,
-                W_anchor*BASELINE_SHARES["treatment"]*BASELINE_HEADROOM)
-
-    base_cap = {}
+    # Vars
+    prob = pl.LpProblem(f"DSS_dyn_v3_{scenario_name}", pl.LpMinimize)
+    cat = pl.LpContinuous
+    yL,yR,yT,nL,nR,nT,sW,sRdef,sTdef,sLexc,sRover,sTover,sLunder = {},{},{},{},{},{},{},{},{},{},{},{},{}
     for r in regions:
-        caps_r = anchor_caps_for_region(r)
-        for y in years:
-            base_cap[(r,y)] = caps_r
-
-    # Model
-    prob = pl.LpProblem(f"DSS_{scenario_name}", pl.LpMinimize)
-    cat = pl.LpInteger if USE_INTEGER_FACILITIES else pl.LpContinuous
-
-    yL,yR,yT,nL,nR,nT = {},{},{},{},{},{}
-    sW, sRdef, sTdef, sLexc = {},{},{},{}
-    for r in regions:
-        for y in years:
+        for y in YEARS:
             yL[(r,y)] = pl.LpVariable(f"yL_{r}_{y}", lowBound=0)
             yR[(r,y)] = pl.LpVariable(f"yR_{r}_{y}", lowBound=0)
             yT[(r,y)] = pl.LpVariable(f"yT_{r}_{y}", lowBound=0)
@@ -172,172 +252,259 @@ def solve_multiyear_scenario(df, scenario_name, sp, years):
             sRdef[(r,y)] = pl.LpVariable(f"sRdef_{r}_{y}", lowBound=0)
             sTdef[(r,y)] = pl.LpVariable(f"sTdef_{r}_{y}", lowBound=0)
             sLexc[(r,y)] = pl.LpVariable(f"sLexc_{r}_{y}", lowBound=0)
+            sRover[(r,y)] = pl.LpVariable(f"sRover_{r}_{y}", lowBound=0)
+            sTover[(r,y)] = pl.LpVariable(f"sTover_{r}_{y}", lowBound=0)
+            sLunder[(r,y)] = pl.LpVariable(f"sLunder_{r}_{y}", lowBound=0)
+
+    default_lead = {"landfill":0,"recycle":1,"treatment":1}
+    if lead_times is None: lead_times = {}
+    lead = {**default_lead, **lead_times}
+
+    per = {"landfill":1_000_000,
+           "recycle":  float((per_fac_override or {}).get("recycle", 120_000)),
+           "treatment":float((per_fac_override or {}).get("treatment", 350_000))}
 
     def avail_cap(r,y, kind):
-        baseL,baseR,baseT = base_cap[(r,y)]
+        baseL,baseR,baseT = base_caps_func(y)
         base_val = {"landfill":baseL,"recycle":baseR,"treatment":baseT}[kind]
-        lead = FACILITY_LEAD_TIME_YEARS[kind]
-        add_list=[]
-        for yy in years:
-            if yy + lead <= y:
-                if kind=="landfill": add_list.append(nL[(r,yy)] * PER_FACILITY_CAP[kind])
-                if kind=="recycle":  add_list.append(nR[(r,yy)] * PER_FACILITY_CAP[kind])
-                if kind=="treatment":add_list.append(nT[(r,yy)] * PER_FACILITY_CAP[kind])
-        return base_val + (pl.lpSum(add_list) if add_list else 0)
+        adds=[]
+        for yy in YEARS:
+            if yy + lead[kind] <= y:
+                adds.append({"landfill":nL, "recycle":nR, "treatment":nT}[kind][(r,yy)] * per[kind])
+        return base_val + (pl.lpSum(adds) if adds else 0)
 
+    # Constraints
     for r in regions:
-        for y in years:
+        for y in YEARS:
             W = float(W_use[(r,y)])
-            # Talep denklemi
             prob += yL[(r,y)] + yR[(r,y)] + yT[(r,y)] + sW[(r,y)] == W
-            # Politika hedefleri
-            prob += yR[(r,y)] + sRdef[(r,y)] >= sp["recycle_target"] * W
+
+            rt = (target_by_year or {}).get(y, None)
+            rt = float(rt) if rt is not None and np.isfinite(rt) else sp["recycle_target"]
+            prob += yR[(r,y)] + sRdef[(r,y)] >= rt * W
+            prob += yR[(r,y)] - sRover[(r,y)] <= (rt + sp.get("target_band_up", 0.02)) * W
+
             if sp.get("min_treat_share", None) is not None:
                 prob += yT[(r,y)] + sTdef[(r,y)] >= sp["min_treat_share"] * W
             prob += yL[(r,y)] - sLexc[(r,y)] <= sp["max_landfill_share"] * W
-            # Kapasite
+
+            # Share caps
+            if share_caps.get("recycle_max") is not None:
+                prob += yR[(r,y)] - sRover[(r,y)] <= share_caps["recycle_max"] * W
+            if share_caps.get("treat_max") is not None:
+                prob += yT[(r,y)] - sTover[(r,y)] <= share_caps["treat_max"] * W
+            if share_caps.get("landfill_min") is not None:
+                prob += yL[(r,y)] + sLunder[(r,y)] >= share_caps["landfill_min"] * W
+
+            # Capacity
             prob += yL[(r,y)] <= avail_cap(r,y,"landfill")
             prob += yR[(r,y)] <= avail_cap(r,y,"recycle")
             prob += yT[(r,y)] <= avail_cap(r,y,"treatment")
 
-    # Amaç (NPV maliyet + karbon)
-    obj_terms=[]
+            # Ramp
+            if ramp_limits:
+                prob += nR[(r,y)] <= max_new_per_year.get("recycle", 9999)
+                prob += nT[(r,y)] <= max_new_per_year.get("treatment", 9999)
+                prob += nL[(r,y)] <= max_new_per_year.get("landfill", 9999)
+
+    # Objective
+    DISCOUNT_RATE = sp.get("discount_rate", 0.08)
+    ANNUALIZED_CAPEX_MUSD = {"landfill":5.0,"recycle":3.0,"treatment":12.0}
+    OPEX_USD_PER_TON     = {"landfill":30.0,"recycle":32.0,"treatment":40.0}
+    EMISSION_FACTORS     = {"landfill":480.0,"recycle":60.0,"treatment":200.0}
+    SLACK_PENALTIES      = sp.get("slack_penalties", {"unserved_waste":1000,"recycle_deficit":500,"treat_deficit":1200,"landfill_excess":400})
+
+    obj=[]
     for r in regions:
-        for y in years:
-            dfac = 1.0/((1.0+DISCOUNT_RATE)**(y - years[0]))
+        for y in YEARS:
+            dfac = 1/((1+DISCOUNT_RATE)**(y - YEARS[0]))
             capex = (nL[(r,y)]*ANNUALIZED_CAPEX_MUSD["landfill"] +
                      nR[(r,y)]*ANNUALIZED_CAPEX_MUSD["recycle"]  +
                      nT[(r,y)]*ANNUALIZED_CAPEX_MUSD["treatment"])
             opex  = (yL[(r,y)]*OPEX_USD_PER_TON["landfill"] +
                      yR[(r,y)]*OPEX_USD_PER_TON["recycle"]  +
                      yT[(r,y)]*OPEX_USD_PER_TON["treatment"]) / 1_000_000.0
-            # Emisyon ve karbon
             co2kg = (yL[(r,y)]*EMISSION_FACTORS["landfill"] +
                      yR[(r,y)]*EMISSION_FACTORS["recycle"]  +
                      yT[(r,y)]*EMISSION_FACTORS["treatment"])
             carbon = ((co2kg/1000.0) * sp.get("carbon_price",0.0)) / 1_000_000.0
-            # Slack cezaları
-            pen = (sW[(r,y)]*SLACK_PENALTIES["unserved_waste"] +
-                   sRdef[(r,y)]*SLACK_PENALTIES["recycle_deficit"] +
-                   sTdef[(r,y)]*SLACK_PENALTIES["treat_deficit"] +
-                   sLexc[(r,y)]*SLACK_PENALTIES["landfill_excess"]) / 1_000_000.0
-            obj_terms.append(dfac*(capex + opex + carbon + pen))
 
-    prob += pl.lpSum(obj_terms)
+            pen_base = (sW[(r,y)]*SLACK_PENALTIES["unserved_waste"] +
+                        sRdef[(r,y)]*SLACK_PENALTIES["recycle_deficit"] +
+                        sTdef[(r,y)]*SLACK_PENALTIES["treat_deficit"] +
+                        sLexc[(r,y)]*SLACK_PENALTIES["landfill_excess"]) / 1_000_000.0
+
+            pen_extra = (sRover[(r,y)]*extra_penalties.get("recycle_overshoot",0) +
+                         sTover[(r,y)]*extra_penalties.get("treat_overshoot",0) +
+                         sLunder[(r,y)]*extra_penalties.get("landfill_under",0)) / 1_000_000.0
+
+            obj.append(dfac*(capex+opex+carbon+pen_base+pen_extra))
+    prob += pl.lpSum(obj)
     _ = prob.solve(pl.PULP_CBC_CMD(msg=False))
 
-    # Çıktılar
-    rowsF, rowsN, rowsC, rowsS = [], [], [], []
+    # Outputs
+    rowsF,rowsN,rowsC,rowsS = [],[],[],[]
     for r in regions:
-        for y in years:
-            Lcap = pl.value(avail_cap(r,y,"landfill"))
-            Rcap = pl.value(avail_cap(r,y,"recycle"))
-            Tcap = pl.value(avail_cap(r,y,"treatment"))
-            rowsF.append({"scenario": scenario_name, "region": r, "year": y,
-                          "W_expected_ton": float(W_expected[(r,y)]),
-                          "W_used_ton": float(W_use[(r,y)]),
-                          "y_landfill": pl.value(yL[(r,y)]),
-                          "y_recycle":  pl.value(yR[(r,y)]),
-                          "y_treat":    pl.value(yT[(r,y)])})
-            rowsN.append({"scenario": scenario_name, "region": r, "year": y,
-                          "new_landfills": pl.value(nL[(r,y)]),
-                          "new_recycle_plants": pl.value(nR[(r,y)]),
-                          "new_treatment_plants": pl.value(nT[(r,y)])})
-            rowsC.append({"scenario": scenario_name, "region": r, "year": y,
-                          "cap_landfill": Lcap, "cap_recycle": Rcap, "cap_treatment": Tcap})
-            rowsS.append({"scenario": scenario_name, "region": r, "year": y,
-                          "s_unserved": pl.value(sW[(r,y)]),
-                          "s_recycle_def": pl.value(sRdef[(r,y)]),
-                          "s_treat_def": pl.value(sTdef[(r,y)]),
-                          "s_landfill_exc": pl.value(sLexc[(r,y)])})
-    total_cost = float(pl.value(pl.lpSum(obj_terms)))
-    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC),
-            total_cost, pd.DataFrame(rowsS))
+        for y in YEARS:
+            baseL,baseR,baseT = base_caps_func(y)
+            rowsF.append({"scenario":scenario_name,"region":r,"year":y,
+                          "W_used_ton":W_use[(r,y)],
+                          "y_landfill":pl.value(yL[(r,y)]),
+                          "y_recycle": pl.value(yR[(r,y)]),
+                          "y_treat":   pl.value(yT[(r,y)])})
+            rowsN.append({"scenario":scenario_name,"region":r,"year":y,
+                          "new_landfills":pl.value(nL[(r,y)]),
+                          "new_recycle_plants":pl.value(nR[(r,y)]),
+                          "new_treatment_plants":pl.value(nT[(r,y)])})
+            rowsC.append({"scenario":scenario_name,"region":r,"year":y,
+                          "base_cap_landfill":baseL,"base_cap_recycle":baseR,"base_cap_treatment":baseT})
+            rowsS.append({"scenario":scenario_name,"region":r,"year":y,
+                          "s_unserved":pl.value(sW[(r,y)]),
+                          "s_recycle_def":pl.value(sRdef[(r,y)]),
+                          "s_treat_def":pl.value(sTdef[(r,y)]),
+                          "s_landfill_exc":pl.value(sLexc[(r,y)]),
+                          "s_recycle_overshoot":pl.value(sRover[(r,y)]),
+                          "s_treat_overshoot":pl.value(sTover[(r,y)]),
+                          "s_landfill_under":pl.value(sLunder[(r,y)])})
+    total_cost = float(pl.value(pl.lpSum(obj)))
+    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC), total_cost, pd.DataFrame(rowsS))
 
-# -------------------- UI --------------------
-st.title("♻️ Türkiye MSW — Karar Destek (Streamlit)")
+# =========================
+# UI
+# =========================
+st.title("♻️ Türkiye Belediye Atıkları — RF + DSS v3 (Streamlit)")
 
 with st.sidebar:
-    st.header("1) Veri")
-    up = st.file_uploader("Excel/CSV yükle (opsiyonel)", type=["xlsx","xls","csv"])
-    df = read_input_df(up)
-    st.caption("Gerekli kolonlar: `region`, `year` ve `waste_*_ton_per_year` (biri yeterli).\
-               Kapasiteler varsa: `*_capacity_ton`.")
+    st.header("1) Veriler")
+    up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
+    up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
 
     st.header("2) Zaman Ufku")
-    min_year = int(df["year"].min())
-    max_year = max(int(df["year"].max()), min_year+5)
-    start_y = st.number_input("Başlangıç yılı", value=min_year, step=1)
-    end_y   = st.number_input("Bitiş yılı", value=max_year, step=1)
+    df_main = pd.read_excel(up_main) if (up_main and up_main.name.lower().endswith((".xlsx",".xls"))) \
+              else (pd.read_csv(up_main) if (up_main and up_main.name.lower().endswith(".csv")) else SAMPLE_DF.copy())
+    # temel kontroller
+    for col in ["region","year"]:
+        if col not in df_main.columns:
+            st.error(f"Ulusal veri: '{col}' kolonu gerekli.")
+            st.stop()
+    df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce").astype(int)
+    minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
+    start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
+    end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
     YEARS = list(range(int(start_y), int(end_y)+1))
 
-    st.header("3) Senaryo")
-    preset = st.selectbox("Ön Ayar", list(DEFAULT_PRESETS.keys()), index=1)
-    sp = DEFAULT_PRESETS[preset].copy()
-    # kullanıcı ince ayarları
-    sp["recycle_target"]    = st.slider("Geri dönüşüm hedefi", 0.0, 0.95, sp["recycle_target"], 0.01)
-    sp["min_treat_share"]   = st.slider("Arıtma min. payı",    0.0, 0.50, sp["min_treat_share"], 0.01)
-    sp["max_landfill_share"]= st.slider("Depolama max. payı",  0.0, 1.00, sp["max_landfill_share"], 0.01)
-    sp["growth_multiplier"] = st.slider("Yıllık büyüme katsayısı", 0.90, 1.10, sp["growth_multiplier"], 0.01)
-    sp["uncertainty_pct"]   = st.slider("Belirsizlik (+%)",   0.0, 0.30, sp["uncertainty_pct"], 0.01)
-    sp["carbon_price"]      = st.slider("Karbon fiyatı ($/tCO2e)", 0.0, 200.0, sp["carbon_price"], 1.0)
+    st.header("3) Politika Hedefleri")
+    # Dinamik hedef serisi (tesis tablosundan) varsa kullanacağız
+    sp = dict(
+        recycle_target = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)", 0.0, 0.95, 0.60, 0.01),
+        min_treat_share= st.slider("Arıtma min payı", 0.00, 0.50, 0.15, 0.01),
+        max_landfill_share = st.slider("Depolama max payı", 0.00, 1.00, 0.60, 0.01),
+        target_band_up = st.slider("Hedef üst bandı (+ puan)", 0.00, 0.05, 0.02, 0.01),
+        carbon_price = st.number_input("Karbon fiyatı ($/tCO2e)", value=100.0, step=10.0),
+        growth_multiplier = st.slider("Yıllık büyüme katsayısı", 0.90, 1.10, 1.00, 0.01),
+        uncertainty_pct   = st.slider("Belirsizlik (+%)", 0.0, 0.30, 0.10, 0.01),
+        discount_rate     = st.slider("İskonto oranı", 0.00, 0.20, 0.08, 0.01),
+        slack_penalties   = {"unserved_waste": 1000, "recycle_deficit": 500, "treat_deficit": 1200, "landfill_excess": 400}
+    )
 
-    st.header("4) Emisyon faktörleri (kgCO2e/ton)")
-    EMISSION_FACTORS["landfill"]  = st.number_input("Depolama", value=EMISSION_FACTORS["landfill"])
-    EMISSION_FACTORS["recycle"]   = st.number_input("Geri dönüşüm", value=EMISSION_FACTORS["recycle"])
-    EMISSION_FACTORS["treatment"] = st.number_input("Arıtma", value=EMISSION_FACTORS["treatment"])
+    st.header("4) Pay Sınırları ve Cezalar")
+    recycle_max = st.slider("Geri dönüşüm üst tavanı", 0.50, 0.95, 0.85, 0.01)
+    treat_max   = st.slider("Arıtma üst tavanı", 0.20, 0.60, 0.35, 0.01)
+    landfill_min= st.slider("Depolama alt tabanı", 0.00, 0.10, 0.02, 0.01)
+    overshoot_pen = st.number_input("Overshoot cezası ($/ton) [geri dönüşüm]", value=600.0, step=50.0)
+    landfill_under_pen = st.number_input("Depolama altı cezası ($/ton)", value=150.0, step=10.0)
+
+    st.header("5) Kapasite ve Kurulum")
+    # Tesis tablosundan gelecek; yine de override imkanı veriyoruz
+    per_recycle_default = 120_000.0
+    per_treat_default   = 350_000.0
+    per_recycle = st.number_input("MRF kapasitesi (t/y)", value=per_recycle_default, step=10_000.0, min_value=10_000.0)
+    per_treat   = st.number_input("Arıtma kapasitesi (t/y)", value=per_treat_default, step=10_000.0, min_value=50_000.0)
+
+    max_new_R = st.number_input("Yıllık max yeni MRF (adet)", value=10, step=1, min_value=0)
+    max_new_T = st.number_input("Yıllık max yeni arıtma (adet)", value=22, step=1, min_value=0)
+    lead_recycle   = st.selectbox("MRF lead-time (yıl)", [0,1], index=0)
+    lead_treatment = st.selectbox("Arıtma lead-time (yıl)", [0,1], index=0)
 
     run_btn = st.button("▶︎ Modeli Çalıştır")
 
-st.subheader("Girdi önizleme")
-st.dataframe(df.head(10), use_container_width=True)
+st.subheader("Ulusal veri (ilk 10 satır)")
+st.dataframe(df_main.head(10), use_container_width=True)
 
+# ========= RUN =========
 if run_btn:
-    with st.spinner("Çözülüyor..."):
-        flows_df, new_df, caps_df, npv_cost, slack_df = solve_multiyear_scenario(df, preset, sp, YEARS)
+    with st.spinner("RF imputation + kalibrasyon + DSS çözülüyor..."):
+        # 1) Tesis tablosu: impute
+        dfF = load_facility_table(up_fac)
+        target_by_year = build_target_series_from_facility(dfF) if dfF is not None else None
+        if dfF is not None:
+            base_caps_by_year, per_fac_from_data = capacities_by_year_from_facility(dfF)
+        else:
+            base_caps_by_year, per_fac_from_data = (None, {"recycle": per_recycle, "treatment": per_treat})
 
-    # KPI & grafikler
+        # per-fac override: UI > data-derived (ama alt/üst mantıklı tut)
+        per_fac_override = {
+            "recycle":   float(per_recycle if per_recycle else per_fac_from_data.get("recycle", per_recycle_default)),
+            "treatment": float(per_treat   if per_treat   else per_fac_from_data.get("treatment", per_treat_default)),
+        }
+
+        share_caps = {"recycle_max": float(recycle_max), "treat_max": float(treat_max), "landfill_min": float(landfill_min)}
+        extra_pen  = {"recycle_overshoot": float(overshoot_pen), "treat_overshoot": 10.0, "landfill_under": float(landfill_under_pen)}
+        lead_times = {"recycle": int(lead_recycle), "treatment": int(lead_treatment), "landfill": 0}
+
+        # 2) Solve
+        flows_df, new_df, caps_df, npv_cost, slack_df = solve_with_dynamic_v3(
+            df_main, "Green_v3_streamlit", sp, YEARS,
+            target_by_year=target_by_year,
+            per_fac_override=per_fac_override,
+            base_caps_by_year=base_caps_by_year,
+            ramp_limits=True,
+            max_new_per_year={"recycle": int(max_new_R), "treatment": int(max_new_T), "landfill": 0},
+            share_caps=share_caps,
+            target_band_up=sp["target_band_up"],
+            extra_penalties=extra_pen,
+            lead_times=lead_times
+        )
+
     st.success(f"NPV toplam maliyet: **{npv_cost:,.2f} M$**")
 
+    # Pay grafiği
     g = flows_df.groupby("year").agg(
         yL=("y_landfill","sum"), yR=("y_recycle","sum"), yT=("y_treat","sum"), W=("W_used_ton","sum")
     ).reset_index()
-    g["Landfill share"] = g["yL"]/g["W"]
-    g["Recycle share"]  = g["yR"]/g["W"]
-    g["Treatment share"]= g["yT"]/g["W"]
-
-    area_df = g.melt(id_vars="year", value_vars=["Landfill share","Recycle share","Treatment share"],
+    g["Landfill"] = g["yL"]/g["W"]; g["Recycle"] = g["yR"]/g["W"]; g["Treatment"] = g["yT"]/g["W"]
+    area_df = g.melt(id_vars="year", value_vars=["Landfill","Recycle","Treatment"],
                      var_name="Flow", value_name="Share")
     fig1 = px.area(area_df, x="year", y="Share", color="Flow",
-                   title=f"National Flow Shares — {preset}", groupnorm=None)
+                   title="National Flow Shares — DSS v3")
     fig1.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig1, use_container_width=True)
 
+    # Yeni tesis bar grafiği
     adds = new_df.groupby("year")[["new_landfills","new_recycle_plants","new_treatment_plants"]].sum().reset_index()
     adds = adds.rename(columns={"new_landfills":"Landfill","new_recycle_plants":"Recycle","new_treatment_plants":"Treatment"})
     adds_m = adds.melt(id_vars="year", var_name="Facility", value_name="Count")
     fig2 = px.bar(adds_m, x="year", y="Count", color="Facility", barmode="group",
-                  title=f"New Facilities per Year — {preset}")
+                  title="New Facilities per Year")
     st.plotly_chart(fig2, use_container_width=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.caption("Akışlar (ton)")
-        st.dataframe(flows_df, use_container_width=True)
-        st.download_button("⬇️ Akışlar CSV", data=flows_df.to_csv(index=False).encode("utf-8"),
-                           file_name="flows.csv", mime="text/csv")
-    with c2:
-        st.caption("Yeni tesisler")
-        st.dataframe(new_df, use_container_width=True)
-        st.download_button("⬇️ Yeni tesisler CSV", data=new_df.to_csv(index=False).encode("utf-8"),
-                           file_name="new_facilities.csv", mime="text/csv")
-
-    st.caption("Slack toplamları (ton) — hedef sapmaları")
-    st.dataframe(slack_df.groupby("scenario")[["s_unserved","s_recycle_def","s_treat_def","s_landfill_exc"]].sum(),
+    # Slack özet
+    st.subheader("Slack toplamları (ton)")
+    st.dataframe(slack_df.groupby("year")[["s_unserved","s_recycle_def","s_treat_def","s_landfill_exc",
+                                           "s_recycle_overshoot","s_treat_overshoot","s_landfill_under"]].sum(),
                  use_container_width=True)
-else:
-    st.info("Soldan veriyi/parametreleri seçip **Modeli Çalıştır**’a basın.")
 
-st.markdown("---")
-st.caption("Not: Kapasiteler veride yoksa başlangıç payları ve `BASELINE_HEADROOM` ile türetilir. \
-Integer tesis sayısı gerekirse kod başındaki `USE_INTEGER_FACILITIES=True` yapabilirsiniz (CBC).")
+    # İndirmeler
+    c1,c2,c3 = st.columns(3)
+    with c1:
+        st.download_button("⬇️ Akışlar CSV", flows_df.to_csv(index=False).encode("utf-8"),
+                           file_name="flows_v3.csv", mime="text/csv")
+    with c2:
+        st.download_button("⬇️ Yeni Tesisler CSV", new_df.to_csv(index=False).encode("utf-8"),
+                           file_name="new_facilities_v3.csv", mime="text/csv")
+    with c3:
+        st.download_button("⬇️ Slack CSV", slack_df.to_csv(index=False).encode("utf-8"),
+                           file_name="slack_v3.csv", mime="text/csv")
+
+else:
+    st.info("Soldan verileri/parametreleri seçin ve **Modeli Çalıştır**’a basın. Tesis tablosu yüklerseniz RF ile eksikler tamamlanır; EU hedef serisi otomatik kullanılır.")
