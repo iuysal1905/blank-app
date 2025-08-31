@@ -499,7 +499,7 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                           "s_treat_overshoot":pl.value(sTover[(r,y)]),
                           "s_landfill_under":pl.value(sLunder[(r,y)])})
     total_cost = float(pl.value(pl.lpSum(obj)))
-    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN], pd.DataFrame(rowsC),
+    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC),
             total_cost, pd.DataFrame(rowsS))
 
 # =========================
