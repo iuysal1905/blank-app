@@ -103,11 +103,24 @@ def load_main_table(file_or_path) -> pd.DataFrame:
         st.error("Ulusal veri: Yıl kolonu (year/yıl/yil) bulunamadı.")
         st.stop()
 
+    # Yılı güvenli üret (yy/mm/dd, "2019*", vb varsa 4 haneliyi çekiyoruz)
+    y = pd.to_numeric(
+            raw[year_col].astype(str).str.extract(r"(\d{4})")[0],
+            errors="coerce"
+        )
+    
     df = raw.copy()
-    df.rename(columns={year_col: "year"}, inplace=True)
-    df["year"] = pd.to_numeric(df["year"], errors="coerce")
-    df = df[df["year"].notna()].copy()          # NaN yılları at
-    df["year"] = df["year"].round().astype(int) # sonra int'e çevir
+    # Eski 'year' kolonunu tamamen kaldırıp temiz seriyi ekleyelim
+    if year_col in df.columns and year_col != "year":
+        df = df.rename(columns={year_col: "year"})
+    if "year" in df.columns:
+        df = df.drop(columns=["year"])
+    df["year"] = y
+    
+    # NaN yıl satırlarını at ve int'e çevir
+    df = df[df["year"].notna()].copy()
+    df["year"] = df["year"].round().astype(int)
+
 
 
     # Region yoksa National ekle
@@ -487,9 +500,13 @@ with st.sidebar:
 
     # === Zaman ufku ===
     st.header("2) Zaman Ufku")
-    df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce")
+    y = pd.to_numeric(df_main["year"], errors="coerce")
+    # Mevcut int serinin üstüne NaN yazmamak için drop + ekle:
+    df_main = df_main.drop(columns=["year"])
+    df_main["year"] = y
     df_main = df_main[df_main["year"].notna()].copy()
-    df_main["year"] = df_main["year"].astype(int)
+    df_main["year"] = df_main["year"].round().astype(int)
+
     minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
     start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
     end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
