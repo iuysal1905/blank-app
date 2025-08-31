@@ -105,7 +105,10 @@ def load_main_table(file_or_path) -> pd.DataFrame:
 
     df = raw.copy()
     df.rename(columns={year_col: "year"}, inplace=True)
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(int)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
+    df = df[df["year"].notna()].copy()          # NaN yılları at
+    df["year"] = df["year"].round().astype(int) # sonra int'e çevir
+
 
     # Region yoksa National ekle
     reg_col = _find_first_match(df.columns, MAIN_SYNONYMS["region"])
@@ -484,7 +487,9 @@ with st.sidebar:
 
     # === Zaman ufku ===
     st.header("2) Zaman Ufku")
-    df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce").astype(int)
+    df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce")
+    df_main = df_main[df_main["year"].notna()].copy()
+    df_main["year"] = df_main["year"].astype(int)
     minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
     start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
     end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
