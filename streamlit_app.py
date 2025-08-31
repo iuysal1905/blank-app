@@ -13,6 +13,12 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
 
+# ---- Defaults (tek kaynak) ----
+PER_RECYCLE_DEFAULT = 120_000.0
+PER_TREAT_DEFAULT   = 350_000.0
+DEFAULT_START_YEAR  = 2020
+DEFAULT_END_YEAR    = 2025
+
 # ---- Preset yardımcıları ----
 def _set_if_missing(k, v):
     if k not in st.session_state:
@@ -157,13 +163,14 @@ def load_main_table(file_or_path) -> pd.DataFrame:
             raw[year_col].astype(str).str.extract(r"(\d{4})")[0],
             errors="coerce"
         )
-    
+    y = y.where(y.between(1900, 2100))
     df = raw.copy()
     # Eski 'year' kolonunu tamamen kaldırıp temiz seriyi ekleyelim
     if year_col in df.columns and year_col != "year":
         df = df.rename(columns={year_col: "year"})
     if "year" in df.columns:
         df = df.drop(columns=["year"])
+    df = df.drop(columns=["year"], errors="ignore")
     df["year"] = y
     
     # NaN yıl satırlarını at ve int'e çevir
@@ -549,23 +556,28 @@ with st.sidebar:
 
     # === Zaman ufku ===
     st.header("2) Zaman Ufku")
-    DEFAULT_START_YEAR = 2020
-    DEFAULT_END_YEAR   = 2025
-    if "start_year" not in st.session_state:
-        st.session_state["start_year"] = DEFAULT_START_YEAR
-    if "end_year" not in st.session_state:
-        st.session_state["end_year"] = DEFAULT_END_YEAR
-    y = pd.to_numeric(df_main["year"], errors="coerce")
-    # Mevcut int serinin üstüne NaN yazmamak için drop + ekle:
-    df_main = df_main.drop(columns=["year"])
-    df_main["year"] = y
-    df_main = df_main[df_main["year"].notna()].copy()
-    df_main["year"] = df_main["year"].round().astype(int)
-
-    minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
-    start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
-    end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
+    
+    # df_main zaten yıla normalize edilmiş durumda
+    data_minY = int(df_main["year"].min())
+    data_maxY = int(df_main["year"].max())
+    
+    # İlk açılış varsayılanları
+    _set_if_missing("start_year", DEFAULT_START_YEAR)
+    _set_if_missing("end_year",   DEFAULT_END_YEAR)
+    
+    start_y = st.number_input("Başlangıç yılı",
+                              value=int(st.session_state["start_year"]),
+                              step=1, key="start_year")
+    end_y   = st.number_input("Bitiş yılı",
+                              value=int(st.session_state["end_year"]),
+                              step=1, key="end_year")
+    
+    # Güvenlik: bitiş > başlangıç
+    if end_y <= start_y:
+        end_y = int(start_y) + 1
+    
     YEARS = list(range(int(start_y), int(end_y)+1))
+    st.caption(f"Verideki aralık: {data_minY}–{data_maxY} | Seçim: {int(start_y)}–{int(end_y)}")
 
     # === PRESET BLOĞU ===
     st.header("0) Senaryo Presetleri")
@@ -707,9 +719,12 @@ if run_btn:
             base_caps_by_year, per_fac_from_data = (None, {"recycle": per_recycle, "treatment": per_treat})
 
         per_fac_override = {
-            "recycle":   float(per_recycle if per_recycle else per_fac_from_data.get("recycle", per_recycle_default)),
-            "treatment": float(per_treat   if per_treat   else per_fac_from_data.get("treatment", per_treat_default)),
+            "recycle":   float(per_recycle) if np.isfinite(per_recycle)
+                         else float(per_fac_from_data.get("recycle", PER_RECYCLE_DEFAULT)),
+            "treatment": float(per_treat)   if np.isfinite(per_treat)
+                         else float(per_fac_from_data.get("treatment", PER_TREAT_DEFAULT)),
         }
+
 
         share_caps = {"recycle_max": float(recycle_max), "treat_max": float(treat_max), "landfill_min": float(landfill_min)}
         extra_pen  = {"recycle_overshoot": float(overshoot_pen), "treat_overshoot": 10.0, "landfill_under": float(landfill_under_pen)}
