@@ -375,9 +375,57 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
 st.title("♻️ Türkiye Belediye Atıkları — RF + DSS v3 (Streamlit)")
 
 with st.sidebar:
+ # --- YENİ: repo içi varsayılan dosyalar ---
+from pathlib import Path
+
+DATA_DIR = Path(__file__).parent / "data"
+DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik (2).xlsx"
+DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
+
+@st.cache_data
+def _read_any(path_or_buf):
+    name = str(path_or_buf).lower()
+    if name.endswith((".xlsx",".xls")):
+        return pd.read_excel(path_or_buf)
+    elif name.endswith(".csv"):
+        return pd.read_csv(path_or_buf)
+    else:
+        raise ValueError("Desteklenen formatlar: .xlsx/.xls/.csv")
+
+with st.sidebar:
     st.header("1) Veriler")
-    up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
-    up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
+    use_repo = st.toggle("Repo verisini kullan (önerilir)", value=True, help="data/ klasöründeki dosyaları otomatik yükler.")
+
+    up_main = None
+    up_fac  = None
+    if not use_repo:
+        up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
+        up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
+
+    # Ulusal veri oku
+    if use_repo and DEFAULT_MAIN_PATH.exists():
+        df_main = _read_any(DEFAULT_MAIN_PATH)
+        st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
+    elif up_main is not None:
+        df_main = _read_any(up_main)
+        st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
+    else:
+        df_main = SAMPLE_DF.copy()
+        st.caption("Ulusal veri: örnek dataset kullanılıyor")
+
+    # Tesis tablosu oku (impute fonksiyonumuzla)
+    if use_repo and DEFAULT_FAC_PATH.exists():
+        dfF = load_facility_table(DEFAULT_FAC_PATH)
+        st.caption(f"Tesis tablosu: `{DEFAULT_FAC_PATH.name}` (repo)")
+    elif up_fac is not None:
+        dfF = load_facility_table(up_fac)
+        st.caption(f"Tesis tablosu: yüklenen dosya (`{up_fac.name}`)")
+    else:
+        dfF = None
+        st.caption("Tesis tablosu: (opsiyonel) — yoksa UI’daki kapasite ayarları kullanılır")
+
+  
+
 
     st.header("2) Zaman Ufku")
     df_main = pd.read_excel(up_main) if (up_main and up_main.name.lower().endswith((".xlsx",".xls"))) \
