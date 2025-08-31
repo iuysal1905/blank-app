@@ -27,16 +27,67 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
-# Örnek ulusal veri (yüklenmezse)
-SAMPLE_DF = pd.DataFrame({
-    "region": ["National"]*3,
-    "year":   [2020, 2021, 2022],
-    "waste_collected_ton_per_year": [30_000_000, 29_455_750, 30_283_760],
-    "waste_generated_ton_per_year": [32_000_000, 33_940_700, 31_797_940],
-    "landfill_capacity_ton":  [23_848_460, np.nan, np.nan],
-    "recycle_capacity_ton":   [4_769_692,  np.nan, np.nan],
-    "treatment_capacity_ton": [3_179_794,  np.nan, np.nan],
-})
+# --- YENİ: repo içi varsayılan dosyalar ---
+from pathlib import Path
+
+DATA_DIR = Path(__file__).parent / "data"
+DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik (2).xlsx"
+DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
+
+@st.cache_data
+def _read_any(path_or_buf):
+    name = str(path_or_buf).lower()
+    if name.endswith((".xlsx",".xls")):
+        return pd.read_excel(path_or_buf)
+    elif name.endswith(".csv"):
+        return pd.read_csv(path_or_buf)
+    else:
+        raise ValueError("Desteklenen formatlar: .xlsx/.xls/.csv")
+
+with st.sidebar:
+    st.header("1) Veriler")
+    use_repo = st.toggle("Repo verisini kullan (önerilir)", value=True, help="data/ klasöründeki dosyaları otomatik yükler.")
+
+    up_main = None
+    up_fac  = None
+    if not use_repo:
+        up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
+        up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
+
+    # Ulusal veri oku
+    if use_repo and DEFAULT_MAIN_PATH.exists():
+        df_main = _read_any(DEFAULT_MAIN_PATH)
+        st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
+    elif up_main is not None:
+        df_main = _read_any(up_main)
+        st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
+    else:
+        df_main = SAMPLE_DF.copy()
+        st.caption("Ulusal veri: örnek dataset kullanılıyor")
+
+    # Tesis tablosu oku (impute fonksiyonumuzla)
+    if use_repo and DEFAULT_FAC_PATH.exists():
+        dfF = load_facility_table(DEFAULT_FAC_PATH)
+        st.caption(f"Tesis tablosu: `{DEFAULT_FAC_PATH.name}` (repo)")
+    elif up_fac is not None:
+        dfF = load_facility_table(up_fac)
+        st.caption(f"Tesis tablosu: yüklenen dosya (`{up_fac.name}`)")
+    else:
+        dfF = None
+        st.caption("Tesis tablosu: (opsiyonel) — yoksa UI’daki kapasite ayarları kullanılır")
+
+    # === Zaman ufku ayarları (aynen kalsın) ===
+    st.header("2) Zaman Ufku")
+    for col in ["region","year"]:
+        if col not in df_main.columns:
+            st.error(f"Ulusal veri: '{col}' kolonu gerekli.")
+            st.stop()
+    df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce").astype(int)
+    minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
+    start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
+    end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
+    YEARS = list(range(int(start_y), int(end_y)+1))
+
 
 # =========================
 # A) Facility table: read + RF imputation
