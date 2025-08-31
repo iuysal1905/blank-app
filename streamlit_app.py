@@ -54,6 +54,14 @@ def _read_any(path_or_buf):
         return pd.read_csv(path_or_buf)
     else:
         raise ValueError("Desteklenen formatlar: .xlsx/.xls/.csv")
+def ensure_year_and_region(df: pd.DataFrame) -> pd.DataFrame:
+    if "year" not in df.columns:
+        st.error("Ulusal veri: 'year' kolonu gerekli.")
+        st.stop()
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(int)
+    if "region" not in df.columns:
+        df["region"] = "National"
+    return df
 
 # =========================
 # A) Facility table: read + RF imputation
@@ -404,13 +412,13 @@ with st.sidebar:
 
     # Ulusal veri oku
     if use_repo and DEFAULT_MAIN_PATH.exists():
-        df_main = _read_any(DEFAULT_MAIN_PATH)
+        df_main = ensure_year_and_region(df_main)
         st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
     elif up_main is not None:
-        df_main = _read_any(up_main)
+        df_main = ensure_year_and_region(df_main)
         st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
     else:
-        df_main = SAMPLE_DF.copy()
+        df_main = ensure_year_and_region(df_main)
         st.caption("Ulusal veri: örnek dataset kullanılıyor")
 
     # Tesis tablosu oku (impute fonksiyonumuzla)
@@ -426,10 +434,12 @@ with st.sidebar:
 
     # === Zaman ufku ayarları ===
     st.header("2) Zaman Ufku")
-    for col in ["region","year"]:
-        if col not in df_main.columns:
-            st.error(f"Ulusal veri: '{col}' kolonu gerekli.")
-            st.stop()
+    if "year" not in df_main.columns:
+        st.error("Ulusal veri: 'year' kolonu gerekli.")
+        st.stop()
+    if "region" not in df_main.columns:
+        df_main["region"] = "National"
+
     df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce").astype(int)
     minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
     start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
