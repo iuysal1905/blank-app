@@ -131,68 +131,95 @@ def _find_first_match(cols, patterns):
     return None
 
 def load_main_table(file_or_path) -> pd.DataFrame:
-    # Dosyayı oku (ilk sheet yeterli)
+    """Ulusal veriyi esnekçe oku: tüm sheet'leri dener, yıl için 4 hane / datetime / Excel-serial yollarını dener."""
+    def _parse_raw(raw: pd.DataFrame) -> pd.DataFrame:
+        raw = normalize_cols(raw)
+
+        # --- YIL KOLONU ---
+        year_col = _find_first_match(raw.columns, MAIN_SYNONYMS["year"])
+        if year_col is None:
+            first = raw.columns[0]
+            cand = pd.to_numeric(raw[first], errors="coerce")
+            if cand.between(1900, 2100).any():
+                year_col = first
+        if year_col is None:
+            return pd.DataFrame()  # sheet tutmadı -> boş dön
+
+        # 1) 4 haneli yakala
+        y = pd.to_numeric(raw[year_col].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
+
+        # 2) yetmezse datetime dene (2020-01-01 vb.)
+        if y.notna().sum() < max(1, int(0.5*len(raw))):
+            dt = pd.to_datetime(raw[year_col], errors="coerce", dayfirst=True)
+            # 3) hâlâ yoksa Excel serial dene (43831 -> 2020)
+            if dt.notna().sum() == 0 and pd.api.types.is_numeric_dtype(raw[year_col]):
+                dt = pd.to_datetime(raw[year_col], errors="coerce", unit="D", origin="1899-12-30")
+            if dt.notna().any():
+                y = pd.to_numeric(dt.dt.year, errors="coerce")
+
+        y = y.where(y.between(1900, 2100))
+
+        df = raw.copy()
+        df["year"] = y
+        df = df[df["year"].notna()].copy()
+        if df.empty:
+            return pd.DataFrame()
+        df["year"] = df["year"].round().astype(int)
+
+        # --- REGION ---
+        reg_col = _find_first_match(df.columns, MAIN_SYNONYMS["region"])
+        if reg_col and reg_col != "region":
+            df.rename(columns={reg_col: "region"}, inplace=True)
+        if "region" not in df.columns:
+            df["region"] = "National"
+
+        # --- İÇERİK ---
+        out = df[["year","region"]].copy()
+        for std_key in [
+            "waste_collected_ton_per_year",
+            "waste_generated_ton_per_year",
+            "landfill_capacity_ton",
+            "recycle_capacity_ton",
+            "treatment_capacity_ton",
+        ]:
+            src = _find_first_match(df.columns, MAIN_SYNONYMS.get(std_key, []))
+            if src:
+                series = _clean_decimal_series(df[src])
+                if _has_thousand_word(src):
+                    series = series * 1000.0
+                out[std_key] = series
+
+        # en az bir talep kolonu zorunlu
+        if not (("waste_collected_ton_per_year" in out.columns) or ("waste_generated_ton_per_year" in out.columns)):
+            return pd.DataFrame()
+
+        return out.sort_values(["year","region"]).reset_index(drop=True)
+
+    # --- Dosyayı oku: Excel ise TÜM sheet'leri sırayla dene ---
     name = getattr(file_or_path, "name", None)
+    path_or_buf = file_or_path
     ext = (name or str(file_or_path)).lower().split(".")[-1]
+
     if ext in ("xlsx","xls"):
-        raw = pd.read_excel(file_or_path)
+        xls = pd.ExcelFile(file_or_path)
+        for sh in xls.sheet_names:
+            try:
+                raw = pd.read_excel(file_or_path, sheet_name=sh)
+                parsed = _parse_raw(raw)
+                if not parsed.empty:
+                    return parsed
+            except Exception:
+                continue
+        return pd.DataFrame()  # hiçbir sheet tutmadı
     elif ext == "csv":
-        raw = pd.read_csv(file_or_path)
+        try:
+            raw = pd.read_csv(file_or_path)
+        except UnicodeDecodeError:
+            raw = pd.read_csv(file_or_path, encoding="latin-1")
+        return _parse_raw(raw)
     else:
-        st.error("Ulusal veri: .xlsx/.xls/.csv yükleyin.")
-        st.stop()
+        return pd.DataFrame()
 
-    raw = normalize_cols(raw)
-
-    # Yıl kolonu: önce eşle, olmazsa 1. sütun 1900–2100 aralığı
-    year_col = _find_first_match(raw.columns, MAIN_SYNONYMS["year"])
-    if year_col is None:
-        first = raw.columns[0]
-        cand = pd.to_numeric(raw[first], errors="coerce")
-        if cand.between(1900, 2100).any():
-            year_col = first
-    if year_col is None:
-        st.error("Ulusal veri: Yıl kolonu (year/yıl/yil/date) bulunamadı.")
-        st.stop()
-
-    # 4 haneli yıl çek + aralık filtresi
-    y = pd.to_numeric(raw[year_col].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
-    y = y.where(y.between(1900, 2100))
-
-    df = raw.copy()
-    df["year"] = y
-    df = df[df["year"].notna()].copy()
-    df["year"] = df["year"].round().astype(int)
-
-    # Region yoksa National
-    reg_col = _find_first_match(df.columns, MAIN_SYNONYMS["region"])
-    if reg_col and reg_col != "region":
-        df.rename(columns={reg_col: "region"}, inplace=True)
-    if "region" not in df.columns:
-        df["region"] = "National"
-
-    # İçerik kolonlarını eşleştir + "thousand/bin" ise ×1000
-    out = df[["year","region"]].copy()
-    for std_key in [
-        "waste_collected_ton_per_year",
-        "waste_generated_ton_per_year",
-        "landfill_capacity_ton",
-        "recycle_capacity_ton",
-        "treatment_capacity_ton",
-    ]:
-        src = _find_first_match(df.columns, MAIN_SYNONYMS.get(std_key, []))
-        if src:
-            series = _clean_decimal_series(df[src])
-            if _has_thousand_word(src):
-                series = series * 1000.0
-            out[std_key] = series
-
-    if not (("waste_collected_ton_per_year" in out.columns) or
-            ("waste_generated_ton_per_year" in out.columns)):
-        st.error("Ulusal veri: Toplanan/Üretilen atık kolonlarından en az biri bulunmalı.")
-        st.stop()
-
-    return out.sort_values(["year","region"]).reset_index(drop=True)
 
 # -------------------------------------------------------------------
 # B) TESIS TABLOSU (RF IMPUTE)
@@ -513,7 +540,7 @@ with st.sidebar:
                          help="data/ klasöründeki dosyaları otomatik yükler.")
     up_main = up_fac = None
     if not use_repo:
-        up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
+        up_main = st.file_uploader("Belediye Veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
         up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
 
     # Ulusal veri
