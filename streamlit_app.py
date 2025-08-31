@@ -1,5 +1,7 @@
 # streamlit_app.py
-import re, io, json
+import re, json
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -27,9 +29,18 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
-# --- YENİ: repo içi varsayılan dosyalar ---
-from pathlib import Path
+# Örnek ulusal veri (fallback)
+SAMPLE_DF = pd.DataFrame({
+    "region": ["National"]*3,
+    "year":   [2020, 2021, 2022],
+    "waste_collected_ton_per_year": [30_000_000, 29_455_750, 30_283_760],
+    "waste_generated_ton_per_year": [32_000_000, 33_940_700, 31_797_940],
+    "landfill_capacity_ton":  [23_848_460, np.nan, np.nan],
+    "recycle_capacity_ton":   [4_769_692,  np.nan, np.nan],
+    "treatment_capacity_ton": [3_179_794,  np.nan, np.nan],
+})
 
+# --- Repo içi varsayılan dosyalar ---
 DATA_DIR = Path(__file__).parent / "data"
 DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik (2).xlsx"
 DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
@@ -44,51 +55,6 @@ def _read_any(path_or_buf):
     else:
         raise ValueError("Desteklenen formatlar: .xlsx/.xls/.csv")
 
-with st.sidebar:
-    st.header("1) Veriler")
-    use_repo = st.toggle("Repo verisini kullan (önerilir)", value=True, help="data/ klasöründeki dosyaları otomatik yükler.")
-
-    up_main = None
-    up_fac  = None
-    if not use_repo:
-        up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
-        up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
-
-    # Ulusal veri oku
-    if use_repo and DEFAULT_MAIN_PATH.exists():
-        df_main = _read_any(DEFAULT_MAIN_PATH)
-        st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
-    elif up_main is not None:
-        df_main = _read_any(up_main)
-        st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
-    else:
-        df_main = SAMPLE_DF.copy()
-        st.caption("Ulusal veri: örnek dataset kullanılıyor")
-
-    # Tesis tablosu oku (impute fonksiyonumuzla)
-    if use_repo and DEFAULT_FAC_PATH.exists():
-        dfF = load_facility_table(DEFAULT_FAC_PATH)
-        st.caption(f"Tesis tablosu: `{DEFAULT_FAC_PATH.name}` (repo)")
-    elif up_fac is not None:
-        dfF = load_facility_table(up_fac)
-        st.caption(f"Tesis tablosu: yüklenen dosya (`{up_fac.name}`)")
-    else:
-        dfF = None
-        st.caption("Tesis tablosu: (opsiyonel) — yoksa UI’daki kapasite ayarları kullanılır")
-
-    # === Zaman ufku ayarları (aynen kalsın) ===
-    st.header("2) Zaman Ufku")
-    for col in ["region","year"]:
-        if col not in df_main.columns:
-            st.error(f"Ulusal veri: '{col}' kolonu gerekli.")
-            st.stop()
-    df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce").astype(int)
-    minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
-    start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
-    end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
-    YEARS = list(range(int(start_y), int(end_y)+1))
-
-
 # =========================
 # A) Facility table: read + RF imputation
 # =========================
@@ -101,14 +67,16 @@ def normalize_cols(df):
         return s
     return df.rename(columns={c: norm(c) for c in df.columns})
 
-def load_facility_table(file):
-    if file is None:
+def load_facility_table(file_or_path):
+    if file_or_path is None:
         return None
-    ext = file.name.lower().split(".")[-1]
+    # pathlib.Path veya UploadedFile olabilir
+    name = getattr(file_or_path, "name", None)
+    ext = (name or str(file_or_path)).lower().split(".")[-1]
     if ext in ("xlsx","xls"):
-        raw = pd.read_excel(file)
-    elif ext=="csv":
-        raw = pd.read_csv(file)
+        raw = pd.read_excel(file_or_path)
+    elif ext == "csv":
+        raw = pd.read_csv(file_or_path)
     else:
         st.error("Tesis tablosu: .xlsx/.xls/.csv yükleyin.")
         st.stop()
@@ -421,19 +389,43 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
     return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC), total_cost, pd.DataFrame(rowsS))
 
 # =========================
-# UI
+# UI (TEK SIDEBAR BLOĞU)
 # =========================
 st.title("♻️ Türkiye Belediye Atıkları — RF + DSS v3 (Streamlit)")
 
 with st.sidebar:
     st.header("1) Veriler")
-    up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
-    up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
+    use_repo = st.toggle("Repo verisini kullan (önerilir)", value=True,
+                         help="data/ klasöründeki dosyaları otomatik yükler.")
+    up_main = up_fac = None
+    if not use_repo:
+        up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
+        up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
 
+    # Ulusal veri oku
+    if use_repo and DEFAULT_MAIN_PATH.exists():
+        df_main = _read_any(DEFAULT_MAIN_PATH)
+        st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
+    elif up_main is not None:
+        df_main = _read_any(up_main)
+        st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
+    else:
+        df_main = SAMPLE_DF.copy()
+        st.caption("Ulusal veri: örnek dataset kullanılıyor")
+
+    # Tesis tablosu oku (impute fonksiyonumuzla)
+    if use_repo and DEFAULT_FAC_PATH.exists():
+        dfF = load_facility_table(DEFAULT_FAC_PATH)
+        st.caption(f"Tesis tablosu: `{DEFAULT_FAC_PATH.name}` (repo)")
+    elif up_fac is not None:
+        dfF = load_facility_table(up_fac)
+        st.caption(f"Tesis tablosu: yüklenen dosya (`{up_fac.name}`)")
+    else:
+        dfF = None
+        st.caption("Tesis tablosu: (opsiyonel) — yoksa UI’daki kapasite ayarları kullanılır")
+
+    # === Zaman ufku ayarları ===
     st.header("2) Zaman Ufku")
-    df_main = pd.read_excel(up_main) if (up_main and up_main.name.lower().endswith((".xlsx",".xls"))) \
-              else (pd.read_csv(up_main) if (up_main and up_main.name.lower().endswith(".csv")) else SAMPLE_DF.copy())
-    # temel kontroller
     for col in ["region","year"]:
         if col not in df_main.columns:
             st.error(f"Ulusal veri: '{col}' kolonu gerekli.")
@@ -445,7 +437,6 @@ with st.sidebar:
     YEARS = list(range(int(start_y), int(end_y)+1))
 
     st.header("3) Politika Hedefleri")
-    # Dinamik hedef serisi (tesis tablosundan) varsa kullanacağız
     sp = dict(
         recycle_target = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)", 0.0, 0.95, 0.60, 0.01),
         min_treat_share= st.slider("Arıtma min payı", 0.00, 0.50, 0.15, 0.01),
@@ -466,7 +457,6 @@ with st.sidebar:
     landfill_under_pen = st.number_input("Depolama altı cezası ($/ton)", value=150.0, step=10.0)
 
     st.header("5) Kapasite ve Kurulum")
-    # Tesis tablosundan gelecek; yine de override imkanı veriyoruz
     per_recycle_default = 120_000.0
     per_treat_default   = 350_000.0
     per_recycle = st.number_input("MRF kapasitesi (t/y)", value=per_recycle_default, step=10_000.0, min_value=10_000.0)
@@ -485,15 +475,14 @@ st.dataframe(df_main.head(10), use_container_width=True)
 # ========= RUN =========
 if run_btn:
     with st.spinner("RF imputation + kalibrasyon + DSS çözülüyor..."):
-        # 1) Tesis tablosu: impute
-        dfF = load_facility_table(up_fac)
+        # 1) Tesis tablosu: impute (repo kullanılıyorsa dfF zaten dolu)
         target_by_year = build_target_series_from_facility(dfF) if dfF is not None else None
         if dfF is not None:
             base_caps_by_year, per_fac_from_data = capacities_by_year_from_facility(dfF)
         else:
             base_caps_by_year, per_fac_from_data = (None, {"recycle": per_recycle, "treatment": per_treat})
 
-        # per-fac override: UI > data-derived (ama alt/üst mantıklı tut)
+        # per-fac override: UI > data-derived
         per_fac_override = {
             "recycle":   float(per_recycle if per_recycle else per_fac_from_data.get("recycle", per_recycle_default)),
             "treatment": float(per_treat   if per_treat   else per_fac_from_data.get("treatment", per_treat_default)),
@@ -558,4 +547,4 @@ if run_btn:
                            file_name="slack_v3.csv", mime="text/csv")
 
 else:
-    st.info("Soldan verileri/parametreleri seçin ve **Modeli Çalıştır**’a basın. Tesis tablosu yüklerseniz RF ile eksikler tamamlanır; EU hedef serisi otomatik kullanılır.")
+    st.info("Soldan verileri/parametreleri seçin ve **Modeli Çalıştır**’a basın. Repo modu açıksa data/ klasöründeki dosyalar otomatik yüklenir.")
