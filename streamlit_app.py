@@ -109,7 +109,6 @@ DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
 # A) ULUSAL VERIYI TOLERANSLI OKU (yil/region/kolon ad eşleştirme)
 # -------------------------------------------------------------------
 MAIN_SYNONYMS = {
-    # 'Date' eklendi
     "year":   [r"\byear\b", r"\byil\b", r"\byıl\b", r"\bdate\b"],
     "region": [r"\bregion\b", r"\bbolge\b", r"\bbolge\b", r"\bill\b", r"\bsehir\b"],
     "waste_collected_ton_per_year": [
@@ -499,7 +498,8 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                           "s_treat_overshoot":pl.value(sTover[(r,y)]),
                           "s_landfill_under":pl.value(sLunder[(r,y)])})
     total_cost = float(pl.value(pl.lpSum(obj)))
-    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN], pd.DataFrame(rowsC),
+    # >>> HATA DÜZELTİLDİ: rowsN]'deki kapama parantezi
+    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC),
             total_cost, pd.DataFrame(rowsS))
 
 # =========================
