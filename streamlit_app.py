@@ -25,17 +25,13 @@ def _set_if_missing(k, v):
         st.session_state[k] = v
 
 def apply_preset_to_session(name: str):
-    """Seçilen presetin tüm UI parametrelerini session_state'e yazar."""
     presets = {
         "Baseline": {
-            # Politika
             "sp_recycle_target": 0.60, "sp_min_treat": 0.15, "sp_max_landfill": 0.60,
             "sp_target_band": 0.02, "sp_carbon_price": 50.0, "sp_growth": 1.00,
             "sp_uncertainty": 0.00, "sp_discount": 0.08,
-            # Pay tavan/taban + cezalar
             "cap_recycle_max": 0.85, "cap_treat_max": 0.35, "cap_landfill_min": 0.02,
             "pen_overshoot": 600.0, "pen_landfill_under": 150.0,
-            # Kapasite ve kurulum
             "per_recycle": 120_000.0, "per_treat": 350_000.0,
             "max_new_R": 10, "max_new_T": 22,
             "lead_recycle": 0, "lead_treatment": 1,
@@ -74,7 +70,6 @@ st.set_page_config(page_title="MSW DSS — Türkiye (RF + DSS v3)", page_icon="�
 # Utilities & Defaults
 # =========================
 def _clean_decimal_series(s: pd.Series) -> pd.Series:
-    # "30,13" -> 30.13; boş->NaN
     return pd.to_numeric(s.astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
 def safe_float(x, default=0.0):
@@ -93,6 +88,10 @@ def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
         return s
     return df.rename(columns={c: norm(c) for c in df.columns})
 
+def _has_thousand_word(colname: str) -> bool:
+    c = colname.lower()
+    return ("thousand" in c) or ("bin" in c)
+
 # Örnek ulusal veri (fallback)
 SAMPLE_DF = pd.DataFrame({
     "region": ["National"]*3,
@@ -110,15 +109,15 @@ DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
 # A) ULUSAL VERIYI TOLERANSLI OKU (yil/region/kolon ad eşleştirme)
 # -------------------------------------------------------------------
 MAIN_SYNONYMS = {
-    "year": [r"\byear\b", r"\byil\b", r"\byıl\b"],
-    "region": [r"\bregion\b", r"\bbolge\b", r"\bbolge\b"],
+    # 'Date' eklendi
+    "year":   [r"\byear\b", r"\byil\b", r"\byıl\b", r"\bdate\b"],
+    "region": [r"\bregion\b", r"\bbolge\b", r"\bbolge\b", r"\bill\b", r"\bsehir\b"],
     "waste_collected_ton_per_year": [
         r"waste.*collec", r"toplanan.*atik", r"toplanan_atik", r"collected.*ton"
     ],
     "waste_generated_ton_per_year": [
         r"waste.*generat", r"uretilen.*atik", r"üretilen.*atik", r"generated.*ton"
     ],
-    # Kapasite kolonları opsiyonel; varsa okunur
     "landfill_capacity_ton": [r"landfill.*cap", r"depolama.*kapasite"],
     "recycle_capacity_ton":  [r"recyc.*cap", r"geri donus.*kapasite", r"geri donusum.*kapasite"],
     "treatment_capacity_ton":[r"treat.*cap", r"ar(i|ı)tma.*kapasite", r"bertaraf.*kapasite"]
@@ -133,7 +132,7 @@ def _find_first_match(cols, patterns):
     return None
 
 def load_main_table(file_or_path) -> pd.DataFrame:
-    # Dosyayı oku
+    # Dosyayı oku (ilk sheet yeterli)
     name = getattr(file_or_path, "name", None)
     ext = (name or str(file_or_path)).lower().split(".")[-1]
     if ext in ("xlsx","xls"):
@@ -146,47 +145,34 @@ def load_main_table(file_or_path) -> pd.DataFrame:
 
     raw = normalize_cols(raw)
 
-    # Yıl kolonu bul (year / yil / yıl / ilk sütun fallback)
+    # Yıl kolonu: önce eşle, olmazsa 1. sütun 1900–2100 aralığı
     year_col = _find_first_match(raw.columns, MAIN_SYNONYMS["year"])
     if year_col is None:
-        # ilk sütun numarik ve 1900-2100 aralığında ise yıl varsay
         first = raw.columns[0]
         cand = pd.to_numeric(raw[first], errors="coerce")
         if cand.between(1900, 2100).any():
             year_col = first
     if year_col is None:
-        st.error("Ulusal veri: Yıl kolonu (year/yıl/yil) bulunamadı.")
+        st.error("Ulusal veri: Yıl kolonu (year/yıl/yil/date) bulunamadı.")
         st.stop()
 
-    # Yılı güvenli üret (yy/mm/dd, "2019*", vb varsa 4 haneliyi çekiyoruz)
-    y = pd.to_numeric(
-            raw[year_col].astype(str).str.extract(r"(\d{4})")[0],
-            errors="coerce"
-        )
+    # 4 haneli yıl çek + aralık filtresi
+    y = pd.to_numeric(raw[year_col].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
     y = y.where(y.between(1900, 2100))
+
     df = raw.copy()
-    # Eski 'year' kolonunu tamamen kaldırıp temiz seriyi ekleyelim
-    if year_col in df.columns and year_col != "year":
-        df = df.rename(columns={year_col: "year"})
-    if "year" in df.columns:
-        df = df.drop(columns=["year"])
-    df = df.drop(columns=["year"], errors="ignore")
     df["year"] = y
-    
-    # NaN yıl satırlarını at ve int'e çevir
     df = df[df["year"].notna()].copy()
     df["year"] = df["year"].round().astype(int)
 
-
-
-    # Region yoksa National ekle
+    # Region yoksa National
     reg_col = _find_first_match(df.columns, MAIN_SYNONYMS["region"])
     if reg_col and reg_col != "region":
         df.rename(columns={reg_col: "region"}, inplace=True)
     if "region" not in df.columns:
         df["region"] = "National"
 
-    # İçerik kolonlarını eşleştir
+    # İçerik kolonlarını eşleştir + "thousand/bin" ise ×1000
     out = df[["year","region"]].copy()
     for std_key in [
         "waste_collected_ton_per_year",
@@ -197,9 +183,11 @@ def load_main_table(file_or_path) -> pd.DataFrame:
     ]:
         src = _find_first_match(df.columns, MAIN_SYNONYMS.get(std_key, []))
         if src:
-            out[std_key] = _clean_decimal_series(df[src])
+            series = _clean_decimal_series(df[src])
+            if _has_thousand_word(src):
+                series = series * 1000.0
+            out[std_key] = series
 
-    # En az bir talep kolonu zorunlu
     if not (("waste_collected_ton_per_year" in out.columns) or
             ("waste_generated_ton_per_year" in out.columns)):
         st.error("Ulusal veri: Toplanan/Üretilen atık kolonlarından en az biri bulunmalı.")
@@ -208,7 +196,7 @@ def load_main_table(file_or_path) -> pd.DataFrame:
     return out.sort_values(["year","region"]).reset_index(drop=True)
 
 # -------------------------------------------------------------------
-# B) TESIS TABLOSU (RF IMPUTE)  — aynı kaldı
+# B) TESIS TABLOSU (RF IMPUTE)
 # -------------------------------------------------------------------
 def load_facility_table(file_or_path):
     if file_or_path is None:
@@ -245,25 +233,21 @@ def load_facility_table(file_or_path):
     keep = ["year"] + list(colmap.values())
     dfF = raw[[c for c in keep if c in raw.columns]].copy()
 
-    # numerik dönüşüm
     for c in dfF.columns:
         if c == "year": continue
         dfF[c] = _clean_decimal_series(dfF[c])
 
-    # lag özellikleri
     dfF = dfF.sort_values("year")
     num_cols = [c for c in dfF.columns if c!="year"]
     for c in num_cols:
         dfF[f"{c}_lag1"] = dfF[c].shift(1)
 
-    # RF imputation
     rf = RandomForestRegressor(n_estimators=600, random_state=42, n_jobs=-1)
     imputer = IterativeImputer(estimator=rf, random_state=42, max_iter=20)
     imputed = dfF.copy()
     imp_cols = num_cols + [c for c in dfF.columns if c.endswith("_lag1")]
     imputed[imp_cols] = imputer.fit_transform(imputed[imp_cols])
 
-    # tesis sayıları tamsayı ve >=0
     for c in ["compost_facilities","coincin_facilities","recovery_facilities"]:
         if c in imputed.columns:
             imputed[c] = np.clip(np.round(imputed[c]), 0, None).astype(int)
@@ -325,7 +309,7 @@ def build_target_series_from_facility(dfF):
     return {int(k): float(v) for k,v in t.items()}
 
 # ------------------------------------------------------------
-# D) DSS v3 (aynı – paylaşım kısıtları, ramp, lead-times, vb.)
+# D) DSS v3
 # ------------------------------------------------------------
 def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                           target_by_year=None,
@@ -515,7 +499,7 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                           "s_treat_overshoot":pl.value(sTover[(r,y)]),
                           "s_landfill_under":pl.value(sLunder[(r,y)])})
     total_cost = float(pl.value(pl.lpSum(obj)))
-    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC),
+    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN], pd.DataFrame(rowsC),
             total_cost, pd.DataFrame(rowsS))
 
 # =========================
@@ -542,7 +526,7 @@ with st.sidebar:
     else:
         df_main = SAMPLE_DF.copy()
         st.caption("Ulusal veri: örnek dataset kullanılıyor")
-    # Ulusal veri okundu: df_main
+
     if df_main is None or df_main.empty or ("year" not in df_main.columns):
         st.warning("Ulusal veri geçersiz — örnek veri yüklendi.")
         df_main = SAMPLE_DF.copy()
@@ -560,41 +544,32 @@ with st.sidebar:
 
     # === Zaman ufku ===
     st.header("2) Zaman Ufku")
-    
-    DEFAULT_START_YEAR = 2020
-    DEFAULT_END_YEAR   = 2025
-    
-    # Yıl kolonunu güvenle sayıya çevir
+
     year_vals = pd.to_numeric(df_main["year"], errors="coerce").dropna()
-    year_vals = year_vals[year_vals.between(1900, 2100)]  # mantıklı aralık
-    
-    # Eğer veri setinde geçerli yıl yoksa örnek/veri varsayılanına düş
+    year_vals = year_vals[year_vals.between(1900, 2100)]
     if year_vals.empty:
-        st.warning("Geçerli yıl bulunamadı — 2020–2025 varsayılan aralık kullanılacak.")
         data_minY, data_maxY = DEFAULT_START_YEAR, DEFAULT_END_YEAR
+        st.warning("Geçerli yıl bulunamadı — 2020–2025 varsayılan aralık kullanılacak.")
     else:
         data_minY, data_maxY = int(year_vals.min()), int(year_vals.max())
-    
-    # İlk açılış varsayılanları (session-state)
+
     if "start_year" not in st.session_state:
         st.session_state["start_year"] = DEFAULT_START_YEAR
     if "end_year" not in st.session_state:
         st.session_state["end_year"] = DEFAULT_END_YEAR
-    
+
     start_y = st.number_input("Başlangıç yılı",
                               value=int(st.session_state["start_year"]),
                               step=1, key="start_year")
     end_y   = st.number_input("Bitiş yılı",
                               value=int(st.session_state["end_year"]),
                               step=1, key="end_year")
-    
-    # Güvenlik: bitiş > başlangıç olsun
+
     if end_y <= start_y:
         end_y = int(start_y) + 1
-    
+
     YEARS = list(range(int(start_y), int(end_y)+1))
     st.caption(f"Verideki aralık: {data_minY}–{data_maxY} | Seçim: {int(start_y)}–{int(end_y)}")
-
 
     # === PRESET BLOĞU ===
     st.header("0) Senaryo Presetleri")
@@ -607,7 +582,7 @@ with st.sidebar:
                 apply_preset_to_session(preset_choice)
                 st.rerun()
 
-    # İlk açılışta varsayılan key'leri yükle (Custom başlangıcı)
+    # İlk açılış varsayılanları
     _set_if_missing("sp_recycle_target", 0.60)
     _set_if_missing("sp_min_treat",     0.15)
     _set_if_missing("sp_max_landfill",  0.60)
@@ -632,55 +607,43 @@ with st.sidebar:
 
     st.header("3) Politika Hedefleri")
     sp = dict(
-        recycle_target = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)",
-                                   0.0, 0.95, value=st.session_state["sp_recycle_target"], step=0.01, key="sp_recycle_target"),
-        min_treat_share= st.slider("Arıtma min payı",
-                                   0.00, 0.50, value=st.session_state["sp_min_treat"], step=0.01, key="sp_min_treat"),
+        recycle_target   = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)",
+                                     0.0, 0.95, value=st.session_state["sp_recycle_target"], step=0.01, key="sp_recycle_target"),
+        min_treat_share  = st.slider("Arıtma min payı",
+                                     0.00, 0.50, value=st.session_state["sp_min_treat"], step=0.01, key="sp_min_treat"),
         max_landfill_share = st.slider("Depolama max payı",
-                                   0.00, 1.00, value=st.session_state["sp_max_landfill"], step=0.01, key="sp_max_landfill"),
-        target_band_up = st.slider("Hedef üst bandı (+ puan)",
-                                   0.00, 0.05, value=st.session_state["sp_target_band"], step=0.01, key="sp_target_band"),
-        carbon_price = st.number_input("Karbon fiyatı ($/tCO2e)",
-                                   value=float(st.session_state["sp_carbon_price"]), step=10.0, key="sp_carbon_price"),
-        growth_multiplier = st.slider("Yıllık büyüme katsayısı",
-                                   0.90, 1.10, value=float(st.session_state["sp_growth"]), step=0.01, key="sp_growth"),
-        uncertainty_pct   = st.slider("Belirsizlik (+%)",
-                                   0.0, 0.30, value=float(st.session_state["sp_uncertainty"]), step=0.01, key="sp_uncertainty"),
-        discount_rate     = st.slider("İskonto oranı",
-                                   0.00, 0.20, value=float(st.session_state["sp_discount"]), step=0.01, key="sp_discount"),
-        slack_penalties   = {"unserved_waste": 1000, "recycle_deficit": 500, "treat_deficit": 1200, "landfill_excess": 400}
+                                     0.00, 1.00, value=st.session_state["sp_max_landfill"], step=0.01, key="sp_max_landfill"),
+        target_band_up   = st.slider("Hedef üst bandı (+ puan)",
+                                     0.00, 0.05, value=st.session_state["sp_target_band"], step=0.01, key="sp_target_band"),
+        carbon_price     = st.number_input("Karbon fiyatı ($/tCO2e)",
+                                     value=float(st.session_state["sp_carbon_price"]), step=10.0, key="sp_carbon_price"),
+        growth_multiplier= st.slider("Yıllık büyüme katsayısı",
+                                     0.90, 1.10, value=float(st.session_state["sp_growth"]), step=0.01, key="sp_growth"),
+        uncertainty_pct  = st.slider("Belirsizlik (+%)",
+                                     0.0, 0.30, value=float(st.session_state["sp_uncertainty"]), step=0.01, key="sp_uncertainty"),
+        discount_rate    = st.slider("İskonto oranı",
+                                     0.00, 0.20, value=float(st.session_state["sp_discount"]), step=0.01, key="sp_discount"),
+        slack_penalties  = {"unserved_waste": 1000, "recycle_deficit": 500, "treat_deficit": 1200, "landfill_excess": 400}
     )
 
     st.header("4) Pay Sınırları ve Cezalar")
-    recycle_max = st.slider("Geri dönüşüm üst tavanı",
-                            0.50, 0.95, value=st.session_state["cap_recycle_max"], step=0.01, key="cap_recycle_max")
-    treat_max   = st.slider("Arıtma üst tavanı",
-                            0.20, 0.60, value=st.session_state["cap_treat_max"], step=0.01, key="cap_treat_max")
-    landfill_min= st.slider("Depolama alt tabanı",
-                            0.00, 0.10, value=st.session_state["cap_landfill_min"], step=0.01, key="cap_landfill_min")
-    overshoot_pen = st.number_input("Overshoot cezası ($/ton) [geri dönüşüm]",
-                            value=float(st.session_state["pen_overshoot"]), step=50.0, key="pen_overshoot")
-    landfill_under_pen = st.number_input("Depolama altı cezası ($/ton)",
-                            value=float(st.session_state["pen_landfill_under"]), step=10.0, key="pen_landfill_under")
+    recycle_max = st.slider("Geri dönüşüm üst tavanı", 0.50, 0.95, value=st.session_state["cap_recycle_max"], step=0.01, key="cap_recycle_max")
+    treat_max   = st.slider("Arıtma üst tavanı",       0.20, 0.60, value=st.session_state["cap_treat_max"],   step=0.01, key="cap_treat_max")
+    landfill_min= st.slider("Depolama alt tabanı",     0.00, 0.10, value=st.session_state["cap_landfill_min"],step=0.01, key="cap_landfill_min")
+    overshoot_pen = st.number_input("Overshoot cezası ($/ton) [geri dönüşüm]", value=float(st.session_state["pen_overshoot"]), step=50.0, key="pen_overshoot")
+    landfill_under_pen = st.number_input("Depolama altı cezası ($/ton)", value=float(st.session_state["pen_landfill_under"]), step=10.0, key="pen_landfill_under")
 
     st.header("5) Kapasite ve Kurulum")
-    per_recycle = st.number_input("MRF kapasitesi (t/y)",
-                            value=float(st.session_state["per_recycle"]), step=10_000.0, min_value=10_000.0, key="per_recycle")
-    per_treat   = st.number_input("Arıtma kapasitesi (t/y)",
-                            value=float(st.session_state["per_treat"]),   step=10_000.0, min_value=50_000.0, key="per_treat")
+    per_recycle = st.number_input("MRF kapasitesi (t/y)",  value=float(st.session_state["per_recycle"]), step=10_000.0, min_value=10_000.0, key="per_recycle")
+    per_treat   = st.number_input("Arıtma kapasitesi (t/y)", value=float(st.session_state["per_treat"]),   step=10_000.0, min_value=50_000.0, key="per_treat")
 
-    max_new_R = st.number_input("Yıllık max yeni MRF (adet)",
-                            value=int(st.session_state["max_new_R"]), step=1, min_value=0, key="max_new_R")
-    max_new_T = st.number_input("Yıllık max yeni arıtma (adet)",
-                            value=int(st.session_state["max_new_T"]), step=1, min_value=0, key="max_new_T")
-    lead_recycle   = st.selectbox("MRF lead-time (yıl)",
-                            [0,1], index=[0,1].index(int(st.session_state["lead_recycle"])), key="lead_recycle")
-    lead_treatment = st.selectbox("Arıtma lead-time (yıl)",
-                            [0,1], index=[0,1].index(int(st.session_state["lead_treatment"])), key="lead_treatment")
+    max_new_R = st.number_input("Yıllık max yeni MRF (adet)", value=int(st.session_state["max_new_R"]), step=1, min_value=0, key="max_new_R")
+    max_new_T = st.number_input("Yıllık max yeni arıtma (adet)", value=int(st.session_state["max_new_T"]), step=1, min_value=0, key="max_new_T")
+    lead_recycle   = st.selectbox("MRF lead-time (yıl)", [0,1], index=[0,1].index(int(st.session_state["lead_recycle"])),     key="lead_recycle")
+    lead_treatment = st.selectbox("Arıtma lead-time (yıl)", [0,1], index=[0,1].index(int(st.session_state["lead_treatment"])), key="lead_treatment")
 
     run_btn = st.button("▶︎ Modeli Çalıştır")
 
-    # (Opsiyonel) Konfig JSON indir
     cfg = {
         "preset": preset_choice,
         "years": [int(start_y), int(end_y)],
@@ -704,24 +667,13 @@ with st.sidebar:
             "landfill_under": st.session_state["pen_landfill_under"],
             "treat_overshoot": 10.0,
         },
-        "per_fac": {
-            "recycle": st.session_state["per_recycle"],
-            "treatment": st.session_state["per_treat"],
-        },
-        "ramp_limits": {
-            "max_new_R": int(st.session_state["max_new_R"]),
-            "max_new_T": int(st.session_state["max_new_T"]),
-        },
-        "lead_times": {
-            "recycle": int(st.session_state["lead_recycle"]),
-            "treatment": int(st.session_state["lead_treatment"]),
-            "landfill": 0
-        },
+        "per_fac": {"recycle": st.session_state["per_recycle"], "treatment": st.session_state["per_treat"]},
+        "ramp_limits": {"max_new_R": int(st.session_state["max_new_R"]), "max_new_T": int(st.session_state["max_new_T"])},
+        "lead_times": {"recycle": int(st.session_state["lead_recycle"]), "treatment": int(st.session_state["lead_treatment"]), "landfill": 0},
         "use_repo": use_repo,
     }
     st.download_button("⬇️ Parametreleri JSON indir", data=json.dumps(cfg, indent=2),
                        file_name=f"config_{preset_choice.lower()}.json", mime="application/json")
-
 
 st.subheader("Ulusal veri (ilk 10 satır)")
 st.dataframe(df_main.head(10), use_container_width=True)
@@ -741,7 +693,6 @@ if run_btn:
             "treatment": float(per_treat)   if np.isfinite(per_treat)
                          else float(per_fac_from_data.get("treatment", PER_TREAT_DEFAULT)),
         }
-
 
         share_caps = {"recycle_max": float(recycle_max), "treat_max": float(treat_max), "landfill_min": float(landfill_min)}
         extra_pen  = {"recycle_overshoot": float(overshoot_pen), "treat_overshoot": 10.0, "landfill_under": float(landfill_under_pen)}
@@ -766,8 +717,7 @@ if run_btn:
         yL=("y_landfill","sum"), yR=("y_recycle","sum"), yT=("y_treat","sum"), W=("W_used_ton","sum")
     ).reset_index()
     g["Landfill"] = g["yL"]/g["W"]; g["Recycle"] = g["yR"]/g["W"]; g["Treatment"] = g["yT"]/g["W"]
-    area_df = g.melt(id_vars="year", value_vars=["Landfill","Recycle","Treatment"],
-                     var_name="Flow", value_name="Share")
+    area_df = g.melt(id_vars="year", value_vars=["Landfill","Recycle","Treatment"], var_name="Flow", value_name="Share")
     fig1 = px.area(area_df, x="year", y="Share", color="Flow", title="National Flow Shares — DSS v3")
     fig1.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig1, use_container_width=True)
