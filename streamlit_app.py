@@ -18,7 +18,7 @@ st.set_page_config(page_title="MSW DSS — Türkiye (RF + DSS v3)", page_icon="�
 # =========================
 # Utilities & Defaults
 # =========================
-def _clean_decimal_series(s):
+def _clean_decimal_series(s: pd.Series) -> pd.Series:
     # "30,13" -> 30.13; boş->NaN
     return pd.to_numeric(s.astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
@@ -29,44 +29,7 @@ def safe_float(x, default=0.0):
     except Exception:
         return default
 
-# Örnek ulusal veri (fallback)
-SAMPLE_DF = pd.DataFrame({
-    "region": ["National"]*3,
-    "year":   [2020, 2021, 2022],
-    "waste_collected_ton_per_year": [30_000_000, 29_455_750, 30_283_760],
-    "waste_generated_ton_per_year": [32_000_000, 33_940_700, 31_797_940],
-    "landfill_capacity_ton":  [23_848_460, np.nan, np.nan],
-    "recycle_capacity_ton":   [4_769_692,  np.nan, np.nan],
-    "treatment_capacity_ton": [3_179_794,  np.nan, np.nan],
-})
-
-# --- Repo içi varsayılan dosyalar ---
-DATA_DIR = Path(__file__).parent / "data"
-DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik (2).xlsx"
-DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
-
-@st.cache_data
-def _read_any(path_or_buf):
-    name = str(path_or_buf).lower()
-    if name.endswith((".xlsx",".xls")):
-        return pd.read_excel(path_or_buf)
-    elif name.endswith(".csv"):
-        return pd.read_csv(path_or_buf)
-    else:
-        raise ValueError("Desteklenen formatlar: .xlsx/.xls/.csv")
-def ensure_year_and_region(df: pd.DataFrame) -> pd.DataFrame:
-    if "year" not in df.columns:
-        st.error("Ulusal veri: 'year' kolonu gerekli.")
-        st.stop()
-    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(int)
-    if "region" not in df.columns:
-        df["region"] = "National"
-    return df
-
-# =========================
-# A) Facility table: read + RF imputation
-# =========================
-def normalize_cols(df):
+def normalize_cols(df: pd.DataFrame) -> pd.DataFrame:
     def norm(c):
         s = c.lower()
         s = (s.replace("ı","i").replace("ğ","g").replace("ü","u")
@@ -75,10 +38,109 @@ def normalize_cols(df):
         return s
     return df.rename(columns={c: norm(c) for c in df.columns})
 
+# Örnek ulusal veri (fallback)
+SAMPLE_DF = pd.DataFrame({
+    "region": ["National"]*3,
+    "year":   [2020, 2021, 2022],
+    "waste_collected_ton_per_year": [30_000_000, 29_455_750, 30_283_760],
+    "waste_generated_ton_per_year": [32_000_000, 33_940_700, 31_797_940],
+})
+
+# --- Repo içi varsayılan dosyalar ---
+DATA_DIR = Path(__file__).parent / "data"
+DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik (2).xlsx"
+DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
+
+# -------------------------------------------------------------------
+# A) ULUSAL VERIYI TOLERANSLI OKU (yil/region/kolon ad eşleştirme)
+# -------------------------------------------------------------------
+MAIN_SYNONYMS = {
+    "year": [r"\byear\b", r"\byil\b", r"\byıl\b"],
+    "region": [r"\bregion\b", r"\bbolge\b", r"\bbolge\b"],
+    "waste_collected_ton_per_year": [
+        r"waste.*collec", r"toplanan.*atik", r"toplanan_atik", r"collected.*ton"
+    ],
+    "waste_generated_ton_per_year": [
+        r"waste.*generat", r"uretilen.*atik", r"üretilen.*atik", r"generated.*ton"
+    ],
+    # Kapasite kolonları opsiyonel; varsa okunur
+    "landfill_capacity_ton": [r"landfill.*cap", r"depolama.*kapasite"],
+    "recycle_capacity_ton":  [r"recyc.*cap", r"geri donus.*kapasite", r"geri donusum.*kapasite"],
+    "treatment_capacity_ton":[r"treat.*cap", r"ar(i|ı)tma.*kapasite", r"bertaraf.*kapasite"]
+}
+
+def _find_first_match(cols, patterns):
+    for pat in patterns:
+        rx = re.compile(pat)
+        for c in cols:
+            if rx.search(c):
+                return c
+    return None
+
+def load_main_table(file_or_path) -> pd.DataFrame:
+    # Dosyayı oku
+    name = getattr(file_or_path, "name", None)
+    ext = (name or str(file_or_path)).lower().split(".")[-1]
+    if ext in ("xlsx","xls"):
+        raw = pd.read_excel(file_or_path)
+    elif ext == "csv":
+        raw = pd.read_csv(file_or_path)
+    else:
+        st.error("Ulusal veri: .xlsx/.xls/.csv yükleyin.")
+        st.stop()
+
+    raw = normalize_cols(raw)
+
+    # Yıl kolonu bul (year / yil / yıl / ilk sütun fallback)
+    year_col = _find_first_match(raw.columns, MAIN_SYNONYMS["year"])
+    if year_col is None:
+        # ilk sütun numarik ve 1900-2100 aralığında ise yıl varsay
+        first = raw.columns[0]
+        cand = pd.to_numeric(raw[first], errors="coerce")
+        if cand.between(1900, 2100).any():
+            year_col = first
+    if year_col is None:
+        st.error("Ulusal veri: Yıl kolonu (year/yıl/yil) bulunamadı.")
+        st.stop()
+
+    df = raw.copy()
+    df.rename(columns={year_col: "year"}, inplace=True)
+    df["year"] = pd.to_numeric(df["year"], errors="coerce").astype(int)
+
+    # Region yoksa National ekle
+    reg_col = _find_first_match(df.columns, MAIN_SYNONYMS["region"])
+    if reg_col and reg_col != "region":
+        df.rename(columns={reg_col: "region"}, inplace=True)
+    if "region" not in df.columns:
+        df["region"] = "National"
+
+    # İçerik kolonlarını eşleştir
+    out = df[["year","region"]].copy()
+    for std_key in [
+        "waste_collected_ton_per_year",
+        "waste_generated_ton_per_year",
+        "landfill_capacity_ton",
+        "recycle_capacity_ton",
+        "treatment_capacity_ton",
+    ]:
+        src = _find_first_match(df.columns, MAIN_SYNONYMS.get(std_key, []))
+        if src:
+            out[std_key] = _clean_decimal_series(df[src])
+
+    # En az bir talep kolonu zorunlu
+    if not (("waste_collected_ton_per_year" in out.columns) or
+            ("waste_generated_ton_per_year" in out.columns)):
+        st.error("Ulusal veri: Toplanan/Üretilen atık kolonlarından en az biri bulunmalı.")
+        st.stop()
+
+    return out.sort_values(["year","region"]).reset_index(drop=True)
+
+# -------------------------------------------------------------------
+# B) TESIS TABLOSU (RF IMPUTE)  — aynı kaldı
+# -------------------------------------------------------------------
 def load_facility_table(file_or_path):
     if file_or_path is None:
         return None
-    # pathlib.Path veya UploadedFile olabilir
     name = getattr(file_or_path, "name", None)
     ext = (name or str(file_or_path)).lower().split(".")[-1]
     if ext in ("xlsx","xls"):
@@ -88,8 +150,9 @@ def load_facility_table(file_or_path):
     else:
         st.error("Tesis tablosu: .xlsx/.xls/.csv yükleyin.")
         st.stop()
+
     raw = normalize_cols(raw)
-    # yıl kolonu yoksa ilk kolonu year yap
+
     if "year" not in raw.columns:
         raw = raw.rename(columns={raw.columns[0]: "year"})
     raw["year"] = pd.to_numeric(raw["year"], errors="coerce").astype("Int64")
@@ -133,19 +196,13 @@ def load_facility_table(file_or_path):
         if c in imputed.columns:
             imputed[c] = np.clip(np.round(imputed[c]), 0, None).astype(int)
 
-    # lagları temizle
     imputed.drop(columns=[c for c in imputed.columns if c.endswith("_lag1")], inplace=True, errors="ignore")
     return imputed
 
-# =========================
-# B) Year-by-year base capacity + per-facility capacity
-# =========================
+# -----------------------
+# C) Kapasite çıkarımı
+# -----------------------
 def capacities_by_year_from_facility(dfF):
-    """
-    Döner:
-      base_caps_by_year: {year: {'recycle': cap_ton, 'treatment': cap_ton}}
-      per_fac: {'recycle': ton/y, 'treatment': ton/y}  (median)
-    """
     dfF = dfF.sort_values("year").reset_index(drop=True)
 
     def safe_ratio(num, den):
@@ -195,9 +252,9 @@ def build_target_series_from_facility(dfF):
     t = t.interpolate("linear", limit_direction="both")
     return {int(k): float(v) for k,v in t.items()}
 
-# =========================
-# C) DSS v3 (share caps + overshoot + ramp + lead-times)
-# =========================
+# ------------------------------------------------------------
+# D) DSS v3 (aynı – paylaşım kısıtları, ramp, lead-times, vb.)
+# ------------------------------------------------------------
 def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                           target_by_year=None,
                           per_fac_override=None,
@@ -212,7 +269,6 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
     regions = ["National"]
     data_minY, data_maxY = int(df_main["year"].min()), int(df_main["year"].max())
 
-    # Demand projection
     def last_valid_before_or_equal(y, r):
         for yy in range(min(y, data_maxY), data_minY-1, -1):
             sub = df_main[(df_main["year"]==yy)&(df_main["region"]==r)]
@@ -248,9 +304,9 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                 delta = y - data_maxY
                 base = ref_last * (sp["growth_multiplier"] ** delta)
             W_expected[(r,y)] = base
-    W_use = {(r,y): safe_float(W_expected[(r,y)]*(1.0+sp.get("uncertainty_pct",0.0)),0.0) for r in regions for y in YEARS}
+    W_use = {(r,y): safe_float(W_expected[(r,y)]*(1.0+sp.get("uncertainty_pct",0.0)),0.0)
+             for r in regions for y in YEARS}
 
-    # Base capacities per year
     def base_caps_func(y):
         if base_caps_by_year and y in base_caps_by_year:
             Rcap = float(base_caps_by_year[y].get("recycle",0.0) or 0.0)
@@ -263,7 +319,6 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
         Lcap = max(Wa_y*landfill_share_for_base*1.05, 0.0)
         return Lcap, Rcap, Tcap
 
-    # Vars
     prob = pl.LpProblem(f"DSS_dyn_v3_{scenario_name}", pl.LpMinimize)
     cat = pl.LpContinuous
     yL,yR,yT,nL,nR,nT,sW,sRdef,sTdef,sLexc,sRover,sTover,sLunder = {},{},{},{},{},{},{},{},{},{},{},{},{}
@@ -300,7 +355,6 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                 adds.append({"landfill":nL, "recycle":nR, "treatment":nT}[kind][(r,yy)] * per[kind])
         return base_val + (pl.lpSum(adds) if adds else 0)
 
-    # Constraints
     for r in regions:
         for y in YEARS:
             W = float(W_use[(r,y)])
@@ -315,7 +369,6 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                 prob += yT[(r,y)] + sTdef[(r,y)] >= sp["min_treat_share"] * W
             prob += yL[(r,y)] - sLexc[(r,y)] <= sp["max_landfill_share"] * W
 
-            # Share caps
             if share_caps.get("recycle_max") is not None:
                 prob += yR[(r,y)] - sRover[(r,y)] <= share_caps["recycle_max"] * W
             if share_caps.get("treat_max") is not None:
@@ -323,18 +376,15 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
             if share_caps.get("landfill_min") is not None:
                 prob += yL[(r,y)] + sLunder[(r,y)] >= share_caps["landfill_min"] * W
 
-            # Capacity
             prob += yL[(r,y)] <= avail_cap(r,y,"landfill")
             prob += yR[(r,y)] <= avail_cap(r,y,"recycle")
             prob += yT[(r,y)] <= avail_cap(r,y,"treatment")
 
-            # Ramp
             if ramp_limits:
                 prob += nR[(r,y)] <= max_new_per_year.get("recycle", 9999)
                 prob += nT[(r,y)] <= max_new_per_year.get("treatment", 9999)
                 prob += nL[(r,y)] <= max_new_per_year.get("landfill", 9999)
 
-    # Objective
     DISCOUNT_RATE = sp.get("discount_rate", 0.08)
     ANNUALIZED_CAPEX_MUSD = {"landfill":5.0,"recycle":3.0,"treatment":12.0}
     OPEX_USD_PER_TON     = {"landfill":30.0,"recycle":32.0,"treatment":40.0}
@@ -369,7 +419,6 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
     prob += pl.lpSum(obj)
     _ = prob.solve(pl.PULP_CBC_CMD(msg=False))
 
-    # Outputs
     rowsF,rowsN,rowsC,rowsS = [],[],[],[]
     for r in regions:
         for y in YEARS:
@@ -382,7 +431,7 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
             rowsN.append({"scenario":scenario_name,"region":r,"year":y,
                           "new_landfills":pl.value(nL[(r,y)]),
                           "new_recycle_plants":pl.value(nR[(r,y)]),
-                          "new_treatment_plants":pl.value(nT[(r,y)])})
+                          "new_treatment_plants":pl.value(nT[(r,y)] )})
             rowsC.append({"scenario":scenario_name,"region":r,"year":y,
                           "base_cap_landfill":baseL,"base_cap_recycle":baseR,"base_cap_treatment":baseT})
             rowsS.append({"scenario":scenario_name,"region":r,"year":y,
@@ -394,7 +443,8 @@ def solve_with_dynamic_v3(df_main, scenario_name, sp, YEARS,
                           "s_treat_overshoot":pl.value(sTover[(r,y)]),
                           "s_landfill_under":pl.value(sLunder[(r,y)])})
     total_cost = float(pl.value(pl.lpSum(obj)))
-    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC), total_cost, pd.DataFrame(rowsS))
+    return (pd.DataFrame(rowsF), pd.DataFrame(rowsN), pd.DataFrame(rowsC),
+            total_cost, pd.DataFrame(rowsS))
 
 # =========================
 # UI (TEK SIDEBAR BLOĞU)
@@ -410,21 +460,18 @@ with st.sidebar:
         up_main = st.file_uploader("Ulusal veri (xlsx/csv)", type=["xlsx","xls","csv"], key="main")
         up_fac  = st.file_uploader("Tesis tablosu (xlsx/csv) — RF impute", type=["xlsx","xls","csv"], key="fac")
 
-    # Ulusal veri oku
+    # Ulusal veri
     if use_repo and DEFAULT_MAIN_PATH.exists():
-        df_main = _read_any(DEFAULT_MAIN_PATH)          # önce oku
-        df_main = ensure_year_and_region(df_main)       # sonra normalize et
+        df_main = load_main_table(DEFAULT_MAIN_PATH)
         st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
     elif up_main is not None:
-        df_main = _read_any(up_main)                    # önce oku
-        df_main = ensure_year_and_region(df_main)       # sonra normalize et
+        df_main = load_main_table(up_main)
         st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
     else:
-        df_main = ensure_year_and_region(SAMPLE_DF.copy())
+        df_main = SAMPLE_DF.copy()
         st.caption("Ulusal veri: örnek dataset kullanılıyor")
 
-
-    # Tesis tablosu oku (impute fonksiyonumuzla)
+    # Tesis tablosu
     if use_repo and DEFAULT_FAC_PATH.exists():
         dfF = load_facility_table(DEFAULT_FAC_PATH)
         st.caption(f"Tesis tablosu: `{DEFAULT_FAC_PATH.name}` (repo)")
@@ -435,20 +482,15 @@ with st.sidebar:
         dfF = None
         st.caption("Tesis tablosu: (opsiyonel) — yoksa UI’daki kapasite ayarları kullanılır")
 
-    # === Zaman ufku ayarları ===
+    # === Zaman ufku ===
     st.header("2) Zaman Ufku")
-    if "year" not in df_main.columns:
-        st.error("Ulusal veri: 'year' kolonu gerekli.")
-        st.stop()
-    if "region" not in df_main.columns:
-        df_main["region"] = "National"
-
     df_main["year"] = pd.to_numeric(df_main["year"], errors="coerce").astype(int)
     minY = int(df_main["year"].min()); maxY = max(int(df_main["year"].max()), minY+5)
     start_y = st.number_input("Başlangıç yılı", value=minY, step=1)
     end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
     YEARS = list(range(int(start_y), int(end_y)+1))
 
+    # === Politika/Hedefler ===
     st.header("3) Politika Hedefleri")
     sp = dict(
         recycle_target = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)", 0.0, 0.95, 0.60, 0.01),
@@ -488,14 +530,12 @@ st.dataframe(df_main.head(10), use_container_width=True)
 # ========= RUN =========
 if run_btn:
     with st.spinner("RF imputation + kalibrasyon + DSS çözülüyor..."):
-        # 1) Tesis tablosu: impute (repo kullanılıyorsa dfF zaten dolu)
         target_by_year = build_target_series_from_facility(dfF) if dfF is not None else None
         if dfF is not None:
             base_caps_by_year, per_fac_from_data = capacities_by_year_from_facility(dfF)
         else:
             base_caps_by_year, per_fac_from_data = (None, {"recycle": per_recycle, "treatment": per_treat})
 
-        # per-fac override: UI > data-derived
         per_fac_override = {
             "recycle":   float(per_recycle if per_recycle else per_fac_from_data.get("recycle", per_recycle_default)),
             "treatment": float(per_treat   if per_treat   else per_fac_from_data.get("treatment", per_treat_default)),
@@ -505,7 +545,6 @@ if run_btn:
         extra_pen  = {"recycle_overshoot": float(overshoot_pen), "treat_overshoot": 10.0, "landfill_under": float(landfill_under_pen)}
         lead_times = {"recycle": int(lead_recycle), "treatment": int(lead_treatment), "landfill": 0}
 
-        # 2) Solve
         flows_df, new_df, caps_df, npv_cost, slack_df = solve_with_dynamic_v3(
             df_main, "Green_v3_streamlit", sp, YEARS,
             target_by_year=target_by_year,
@@ -521,33 +560,29 @@ if run_btn:
 
     st.success(f"NPV toplam maliyet: **{npv_cost:,.2f} M$**")
 
-    # Pay grafiği
     g = flows_df.groupby("year").agg(
         yL=("y_landfill","sum"), yR=("y_recycle","sum"), yT=("y_treat","sum"), W=("W_used_ton","sum")
     ).reset_index()
     g["Landfill"] = g["yL"]/g["W"]; g["Recycle"] = g["yR"]/g["W"]; g["Treatment"] = g["yT"]/g["W"]
     area_df = g.melt(id_vars="year", value_vars=["Landfill","Recycle","Treatment"],
                      var_name="Flow", value_name="Share")
-    fig1 = px.area(area_df, x="year", y="Share", color="Flow",
-                   title="National Flow Shares — DSS v3")
+    fig1 = px.area(area_df, x="year", y="Share", color="Flow", title="National Flow Shares — DSS v3")
     fig1.update_yaxes(tickformat=".0%")
     st.plotly_chart(fig1, use_container_width=True)
 
-    # Yeni tesis bar grafiği
     adds = new_df.groupby("year")[["new_landfills","new_recycle_plants","new_treatment_plants"]].sum().reset_index()
     adds = adds.rename(columns={"new_landfills":"Landfill","new_recycle_plants":"Recycle","new_treatment_plants":"Treatment"})
     adds_m = adds.melt(id_vars="year", var_name="Facility", value_name="Count")
-    fig2 = px.bar(adds_m, x="year", y="Count", color="Facility", barmode="group",
-                  title="New Facilities per Year")
+    fig2 = px.bar(adds_m, x="year", y="Count", color="Facility", barmode="group", title="New Facilities per Year")
     st.plotly_chart(fig2, use_container_width=True)
 
-    # Slack özet
     st.subheader("Slack toplamları (ton)")
-    st.dataframe(slack_df.groupby("year")[["s_unserved","s_recycle_def","s_treat_def","s_landfill_exc",
-                                           "s_recycle_overshoot","s_treat_overshoot","s_landfill_under"]].sum(),
-                 use_container_width=True)
+    st.dataframe(
+        slack_df.groupby("year")[["s_unserved","s_recycle_def","s_treat_def","s_landfill_exc",
+                                  "s_recycle_overshoot","s_treat_overshoot","s_landfill_under"]].sum(),
+        use_container_width=True
+    )
 
-    # İndirmeler
     c1,c2,c3 = st.columns(3)
     with c1:
         st.download_button("⬇️ Akışlar CSV", flows_df.to_csv(index=False).encode("utf-8"),
@@ -558,6 +593,5 @@ if run_btn:
     with c3:
         st.download_button("⬇️ Slack CSV", slack_df.to_csv(index=False).encode("utf-8"),
                            file_name="slack_v3.csv", mime="text/csv")
-
 else:
     st.info("Soldan verileri/parametreleri seçin ve **Modeli Çalıştır**’a basın. Repo modu açıksa data/ klasöründeki dosyalar otomatik yüklenir.")
