@@ -13,6 +13,55 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.experimental import enable_iterative_imputer  # noqa: F401
 from sklearn.impute import IterativeImputer
 
+# ---- Preset yardımcıları ----
+def _set_if_missing(k, v):
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+def apply_preset_to_session(name: str):
+    """Seçilen presetin tüm UI parametrelerini session_state'e yazar."""
+    presets = {
+        "Baseline": {
+            # Politika
+            "sp_recycle_target": 0.60, "sp_min_treat": 0.15, "sp_max_landfill": 0.60,
+            "sp_target_band": 0.02, "sp_carbon_price": 50.0, "sp_growth": 1.00,
+            "sp_uncertainty": 0.00, "sp_discount": 0.08,
+            # Pay tavan/taban + cezalar
+            "cap_recycle_max": 0.85, "cap_treat_max": 0.35, "cap_landfill_min": 0.02,
+            "pen_overshoot": 600.0, "pen_landfill_under": 150.0,
+            # Kapasite ve kurulum
+            "per_recycle": 120_000.0, "per_treat": 350_000.0,
+            "max_new_R": 10, "max_new_T": 22,
+            "lead_recycle": 0, "lead_treatment": 1,
+        },
+        "Budget": {
+            "sp_recycle_target": 0.60, "sp_min_treat": 0.15, "sp_max_landfill": 0.60,
+            "sp_target_band": 0.01, "sp_carbon_price": 0.0, "sp_growth": 1.00,
+            "sp_uncertainty": 0.00, "sp_discount": 0.08,
+            "cap_recycle_max": 0.85, "cap_treat_max": 0.35, "cap_landfill_min": 0.02,
+            "pen_overshoot": 600.0, "pen_landfill_under": 150.0,
+            "per_recycle": 120_000.0, "per_treat": 350_000.0,
+            "max_new_R": 6, "max_new_T": 10,
+            "lead_recycle": 1, "lead_treatment": 1,
+        },
+        "Green": {
+            "sp_recycle_target": 0.60, "sp_min_treat": 0.15, "sp_max_landfill": 0.50,
+            "sp_target_band": 0.02, "sp_carbon_price": 100.0, "sp_growth": 1.00,
+            "sp_uncertainty": 0.00, "sp_discount": 0.08,
+            "cap_recycle_max": 0.90, "cap_treat_max": 0.38, "cap_landfill_min": 0.01,
+            "pen_overshoot": 600.0, "pen_landfill_under": 150.0,
+            "per_recycle": 120_000.0, "per_treat": 350_000.0,
+            "max_new_R": 15, "max_new_T": 25,
+            "lead_recycle": 0, "lead_treatment": 1,
+        },
+    }
+    p = presets.get(name)
+    if not p:
+        return
+    for k, v in p.items():
+        st.session_state[k] = v
+
+
 st.set_page_config(page_title="MSW DSS — Türkiye (RF + DSS v3)", page_icon="♻️", layout="wide")
 
 # =========================
@@ -500,6 +549,12 @@ with st.sidebar:
 
     # === Zaman ufku ===
     st.header("2) Zaman Ufku")
+    DEFAULT_START_YEAR = 2020
+    DEFAULT_END_YEAR   = 2025
+    if "start_year" not in st.session_state:
+        st.session_state["start_year"] = DEFAULT_START_YEAR
+    if "end_year" not in st.session_state:
+        st.session_state["end_year"] = DEFAULT_END_YEAR
     y = pd.to_numeric(df_main["year"], errors="coerce")
     # Mevcut int serinin üstüne NaN yazmamak için drop + ekle:
     df_main = df_main.drop(columns=["year"])
@@ -512,39 +567,132 @@ with st.sidebar:
     end_y   = st.number_input("Bitiş yılı", value=maxY, step=1)
     YEARS = list(range(int(start_y), int(end_y)+1))
 
-    # === Politika/Hedefler ===
+    # === PRESET BLOĞU ===
+    st.header("0) Senaryo Presetleri")
+    colp1, colp2 = st.columns([3,1])
+    with colp1:
+        preset_choice = st.selectbox("Preset seç", ["Custom","Baseline","Budget","Green"], index=0)
+    with colp2:
+        if st.button("Uygula"):
+            if preset_choice != "Custom":
+                apply_preset_to_session(preset_choice)
+                st.rerun()
+
+    # İlk açılışta varsayılan key'leri yükle (Custom başlangıcı)
+    _set_if_missing("sp_recycle_target", 0.60)
+    _set_if_missing("sp_min_treat",     0.15)
+    _set_if_missing("sp_max_landfill",  0.60)
+    _set_if_missing("sp_target_band",   0.02)
+    _set_if_missing("sp_carbon_price",  100.0)
+    _set_if_missing("sp_growth",        1.00)
+    _set_if_missing("sp_uncertainty",   0.10)
+    _set_if_missing("sp_discount",      0.08)
+
+    _set_if_missing("cap_recycle_max",  0.85)
+    _set_if_missing("cap_treat_max",    0.35)
+    _set_if_missing("cap_landfill_min", 0.02)
+    _set_if_missing("pen_overshoot",    600.0)
+    _set_if_missing("pen_landfill_under", 150.0)
+
+    _set_if_missing("per_recycle", 120_000.0)
+    _set_if_missing("per_treat",   350_000.0)
+    _set_if_missing("max_new_R",   10)
+    _set_if_missing("max_new_T",   22)
+    _set_if_missing("lead_recycle", 0)
+    _set_if_missing("lead_treatment", 1)
+
     st.header("3) Politika Hedefleri")
     sp = dict(
-        recycle_target = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)", 0.0, 0.95, 0.60, 0.01),
-        min_treat_share= st.slider("Arıtma min payı", 0.00, 0.50, 0.15, 0.01),
-        max_landfill_share = st.slider("Depolama max payı", 0.00, 1.00, 0.60, 0.01),
-        target_band_up = st.slider("Hedef üst bandı (+ puan)", 0.00, 0.05, 0.02, 0.01),
-        carbon_price = st.number_input("Karbon fiyatı ($/tCO2e)", value=100.0, step=10.0),
-        growth_multiplier = st.slider("Yıllık büyüme katsayısı", 0.90, 1.10, 1.00, 0.01),
-        uncertainty_pct   = st.slider("Belirsizlik (+%)", 0.0, 0.30, 0.10, 0.01),
-        discount_rate     = st.slider("İskonto oranı", 0.00, 0.20, 0.08, 0.01),
+        recycle_target = st.slider("Sabit geri dönüşüm hedefi (yoksa EU serisi kullanılır)",
+                                   0.0, 0.95, value=st.session_state["sp_recycle_target"], step=0.01, key="sp_recycle_target"),
+        min_treat_share= st.slider("Arıtma min payı",
+                                   0.00, 0.50, value=st.session_state["sp_min_treat"], step=0.01, key="sp_min_treat"),
+        max_landfill_share = st.slider("Depolama max payı",
+                                   0.00, 1.00, value=st.session_state["sp_max_landfill"], step=0.01, key="sp_max_landfill"),
+        target_band_up = st.slider("Hedef üst bandı (+ puan)",
+                                   0.00, 0.05, value=st.session_state["sp_target_band"], step=0.01, key="sp_target_band"),
+        carbon_price = st.number_input("Karbon fiyatı ($/tCO2e)",
+                                   value=float(st.session_state["sp_carbon_price"]), step=10.0, key="sp_carbon_price"),
+        growth_multiplier = st.slider("Yıllık büyüme katsayısı",
+                                   0.90, 1.10, value=float(st.session_state["sp_growth"]), step=0.01, key="sp_growth"),
+        uncertainty_pct   = st.slider("Belirsizlik (+%)",
+                                   0.0, 0.30, value=float(st.session_state["sp_uncertainty"]), step=0.01, key="sp_uncertainty"),
+        discount_rate     = st.slider("İskonto oranı",
+                                   0.00, 0.20, value=float(st.session_state["sp_discount"]), step=0.01, key="sp_discount"),
         slack_penalties   = {"unserved_waste": 1000, "recycle_deficit": 500, "treat_deficit": 1200, "landfill_excess": 400}
     )
 
     st.header("4) Pay Sınırları ve Cezalar")
-    recycle_max = st.slider("Geri dönüşüm üst tavanı", 0.50, 0.95, 0.85, 0.01)
-    treat_max   = st.slider("Arıtma üst tavanı", 0.20, 0.60, 0.35, 0.01)
-    landfill_min= st.slider("Depolama alt tabanı", 0.00, 0.10, 0.02, 0.01)
-    overshoot_pen = st.number_input("Overshoot cezası ($/ton) [geri dönüşüm]", value=600.0, step=50.0)
-    landfill_under_pen = st.number_input("Depolama altı cezası ($/ton)", value=150.0, step=10.0)
+    recycle_max = st.slider("Geri dönüşüm üst tavanı",
+                            0.50, 0.95, value=st.session_state["cap_recycle_max"], step=0.01, key="cap_recycle_max")
+    treat_max   = st.slider("Arıtma üst tavanı",
+                            0.20, 0.60, value=st.session_state["cap_treat_max"], step=0.01, key="cap_treat_max")
+    landfill_min= st.slider("Depolama alt tabanı",
+                            0.00, 0.10, value=st.session_state["cap_landfill_min"], step=0.01, key="cap_landfill_min")
+    overshoot_pen = st.number_input("Overshoot cezası ($/ton) [geri dönüşüm]",
+                            value=float(st.session_state["pen_overshoot"]), step=50.0, key="pen_overshoot")
+    landfill_under_pen = st.number_input("Depolama altı cezası ($/ton)",
+                            value=float(st.session_state["pen_landfill_under"]), step=10.0, key="pen_landfill_under")
 
     st.header("5) Kapasite ve Kurulum")
-    per_recycle_default = 120_000.0
-    per_treat_default   = 350_000.0
-    per_recycle = st.number_input("MRF kapasitesi (t/y)", value=per_recycle_default, step=10_000.0, min_value=10_000.0)
-    per_treat   = st.number_input("Arıtma kapasitesi (t/y)", value=per_treat_default, step=10_000.0, min_value=50_000.0)
+    per_recycle = st.number_input("MRF kapasitesi (t/y)",
+                            value=float(st.session_state["per_recycle"]), step=10_000.0, min_value=10_000.0, key="per_recycle")
+    per_treat   = st.number_input("Arıtma kapasitesi (t/y)",
+                            value=float(st.session_state["per_treat"]),   step=10_000.0, min_value=50_000.0, key="per_treat")
 
-    max_new_R = st.number_input("Yıllık max yeni MRF (adet)", value=10, step=1, min_value=0)
-    max_new_T = st.number_input("Yıllık max yeni arıtma (adet)", value=22, step=1, min_value=0)
-    lead_recycle   = st.selectbox("MRF lead-time (yıl)", [0,1], index=0)
-    lead_treatment = st.selectbox("Arıtma lead-time (yıl)", [0,1], index=0)
+    max_new_R = st.number_input("Yıllık max yeni MRF (adet)",
+                            value=int(st.session_state["max_new_R"]), step=1, min_value=0, key="max_new_R")
+    max_new_T = st.number_input("Yıllık max yeni arıtma (adet)",
+                            value=int(st.session_state["max_new_T"]), step=1, min_value=0, key="max_new_T")
+    lead_recycle   = st.selectbox("MRF lead-time (yıl)",
+                            [0,1], index=[0,1].index(int(st.session_state["lead_recycle"])), key="lead_recycle")
+    lead_treatment = st.selectbox("Arıtma lead-time (yıl)",
+                            [0,1], index=[0,1].index(int(st.session_state["lead_treatment"])), key="lead_treatment")
 
     run_btn = st.button("▶︎ Modeli Çalıştır")
+
+    # (Opsiyonel) Konfig JSON indir
+    cfg = {
+        "preset": preset_choice,
+        "years": [int(start_y), int(end_y)],
+        "policy": {
+            "recycle_target": st.session_state["sp_recycle_target"],
+            "min_treat_share": st.session_state["sp_min_treat"],
+            "max_landfill_share": st.session_state["sp_max_landfill"],
+            "target_band_up": st.session_state["sp_target_band"],
+            "carbon_price": st.session_state["sp_carbon_price"],
+            "growth_multiplier": st.session_state["sp_growth"],
+            "uncertainty_pct": st.session_state["sp_uncertainty"],
+            "discount_rate": st.session_state["sp_discount"],
+        },
+        "share_caps": {
+            "recycle_max": st.session_state["cap_recycle_max"],
+            "treat_max": st.session_state["cap_treat_max"],
+            "landfill_min": st.session_state["cap_landfill_min"],
+        },
+        "penalties_extra": {
+            "recycle_overshoot": st.session_state["pen_overshoot"],
+            "landfill_under": st.session_state["pen_landfill_under"],
+            "treat_overshoot": 10.0,
+        },
+        "per_fac": {
+            "recycle": st.session_state["per_recycle"],
+            "treatment": st.session_state["per_treat"],
+        },
+        "ramp_limits": {
+            "max_new_R": int(st.session_state["max_new_R"]),
+            "max_new_T": int(st.session_state["max_new_T"]),
+        },
+        "lead_times": {
+            "recycle": int(st.session_state["lead_recycle"]),
+            "treatment": int(st.session_state["lead_treatment"]),
+            "landfill": 0
+        },
+        "use_repo": use_repo,
+    }
+    st.download_button("⬇️ Parametreleri JSON indir", data=json.dumps(cfg, indent=2),
+                       file_name=f"config_{preset_choice.lower()}.json", mime="application/json")
+
 
 st.subheader("Ulusal veri (ilk 10 satır)")
 st.dataframe(df_main.head(10), use_container_width=True)
