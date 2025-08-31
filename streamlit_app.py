@@ -542,6 +542,10 @@ with st.sidebar:
     else:
         df_main = SAMPLE_DF.copy()
         st.caption("Ulusal veri: örnek dataset kullanılıyor")
+    # Ulusal veri okundu: df_main
+    if df_main is None or df_main.empty or ("year" not in df_main.columns):
+        st.warning("Ulusal veri geçersiz — örnek veri yüklendi.")
+        df_main = SAMPLE_DF.copy()
 
     # Tesis tablosu
     if use_repo and DEFAULT_FAC_PATH.exists():
@@ -557,13 +561,25 @@ with st.sidebar:
     # === Zaman ufku ===
     st.header("2) Zaman Ufku")
     
-    # df_main zaten yıla normalize edilmiş durumda
-    data_minY = int(df_main["year"].min())
-    data_maxY = int(df_main["year"].max())
+    DEFAULT_START_YEAR = 2020
+    DEFAULT_END_YEAR   = 2025
     
-    # İlk açılış varsayılanları
-    _set_if_missing("start_year", DEFAULT_START_YEAR)
-    _set_if_missing("end_year",   DEFAULT_END_YEAR)
+    # Yıl kolonunu güvenle sayıya çevir
+    year_vals = pd.to_numeric(df_main["year"], errors="coerce").dropna()
+    year_vals = year_vals[year_vals.between(1900, 2100)]  # mantıklı aralık
+    
+    # Eğer veri setinde geçerli yıl yoksa örnek/veri varsayılanına düş
+    if year_vals.empty:
+        st.warning("Geçerli yıl bulunamadı — 2020–2025 varsayılan aralık kullanılacak.")
+        data_minY, data_maxY = DEFAULT_START_YEAR, DEFAULT_END_YEAR
+    else:
+        data_minY, data_maxY = int(year_vals.min()), int(year_vals.max())
+    
+    # İlk açılış varsayılanları (session-state)
+    if "start_year" not in st.session_state:
+        st.session_state["start_year"] = DEFAULT_START_YEAR
+    if "end_year" not in st.session_state:
+        st.session_state["end_year"] = DEFAULT_END_YEAR
     
     start_y = st.number_input("Başlangıç yılı",
                               value=int(st.session_state["start_year"]),
@@ -572,12 +588,13 @@ with st.sidebar:
                               value=int(st.session_state["end_year"]),
                               step=1, key="end_year")
     
-    # Güvenlik: bitiş > başlangıç
+    # Güvenlik: bitiş > başlangıç olsun
     if end_y <= start_y:
         end_y = int(start_y) + 1
     
     YEARS = list(range(int(start_y), int(end_y)+1))
     st.caption(f"Verideki aralık: {data_minY}–{data_maxY} | Seçim: {int(start_y)}–{int(end_y)}")
+
 
     # === PRESET BLOĞU ===
     st.header("0) Senaryo Presetleri")
