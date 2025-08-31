@@ -412,14 +412,17 @@ with st.sidebar:
 
     # Ulusal veri oku
     if use_repo and DEFAULT_MAIN_PATH.exists():
-        df_main = ensure_year_and_region(df_main)
+        df_main = _read_any(DEFAULT_MAIN_PATH)          # önce oku
+        df_main = ensure_year_and_region(df_main)       # sonra normalize et
         st.caption(f"Ulusal veri: `{DEFAULT_MAIN_PATH.name}` (repo)")
     elif up_main is not None:
-        df_main = ensure_year_and_region(df_main)
+        df_main = _read_any(up_main)                    # önce oku
+        df_main = ensure_year_and_region(df_main)       # sonra normalize et
         st.caption(f"Ulusal veri: yüklenen dosya (`{up_main.name}`)")
     else:
-        df_main = ensure_year_and_region(df_main)
+        df_main = ensure_year_and_region(SAMPLE_DF.copy())
         st.caption("Ulusal veri: örnek dataset kullanılıyor")
+
 
     # Tesis tablosu oku (impute fonksiyonumuzla)
     if use_repo and DEFAULT_FAC_PATH.exists():
