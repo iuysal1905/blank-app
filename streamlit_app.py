@@ -102,7 +102,7 @@ SAMPLE_DF = pd.DataFrame({
 
 # --- Repo içi varsayılan dosyalar ---
 DATA_DIR = Path(__file__).parent / "data"
-DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik (2).xlsx"
+DEFAULT_MAIN_PATH = DATA_DIR / "belediye_atik_.xlsx"
 DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
 
 # -------------------------------------------------------------------
