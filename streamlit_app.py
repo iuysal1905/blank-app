@@ -107,20 +107,32 @@ DEFAULT_FAC_PATH  = DATA_DIR / "tesis.xlsx"
 
 # -------------------------------------------------------------------
 # A) ULUSAL VERIYI TOLERANSLI OKU (yil/region/kolon ad eşleştirme)
-# -------------------------------------------------------------------
 MAIN_SYNONYMS = {
-    "year":   [r"\byear\b", r"\byil\b", r"\byıl\b", r"\bdate\b"],
+    "year":   [r"^(year|yil|yıl|date)$"],  # <-- sadece tam eşleşmeler
     "region": [r"\bregion\b", r"\bbolge\b", r"\bbolge\b", r"\bill\b", r"\bsehir\b"],
-    "waste_collected_ton_per_year": [
-        r"waste.*collec", r"toplanan.*atik", r"toplanan_atik", r"collected.*ton"
-    ],
-    "waste_generated_ton_per_year": [
-        r"waste.*generat", r"uretilen.*atik", r"üretilen.*atik", r"generated.*ton"
-    ],
+    "waste_collected_ton_per_year": [r"waste.*collec", r"toplanan.*atik", r"toplanan_atik", r"collected.*ton"],
+    "waste_generated_ton_per_year": [r"waste.*generat", r"uretilen.*atik", r"üretilen.*atik", r"generated.*ton"],
     "landfill_capacity_ton": [r"landfill.*cap", r"depolama.*kapasite"],
     "recycle_capacity_ton":  [r"recyc.*cap", r"geri donus.*kapasite", r"geri donusum.*kapasite"],
     "treatment_capacity_ton":[r"treat.*cap", r"ar(i|ı)tma.*kapasite", r"bertaraf.*kapasite"]
 }
+
+def detect_year_column(raw: pd.DataFrame) -> str | None:
+    # 1) Tam eşleşme tercih et
+    for c in raw.columns:
+        if re.fullmatch(r"(year|yil|yıl|date)", c):
+            return c
+    # 2) Birim içeren başlıkları ele
+    bad_kw = ("thousand", "/year", "year)", "per year", "ton", "tonne")
+    # 3) Değerleri yıl gibi görünen kolonu bul (>=%60 satır 1900–2100)
+    for c in raw.columns:
+        lc = c.lower()
+        if any(k in lc for k in bad_kw): 
+            continue
+        yy = pd.to_numeric(raw[c].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
+        if (yy.between(1900, 2100).mean() or 0) >= 0.60:
+            return c
+    return None
 
 def _find_first_match(cols, patterns):
     for pat in patterns:
@@ -136,35 +148,20 @@ def load_main_table(file_or_path) -> pd.DataFrame:
         raw = normalize_cols(raw)
 
         # --- YIL KOLONU ---
-        year_col = _find_first_match(raw.columns, MAIN_SYNONYMS["year"])
+              
+        year_col = detect_year_column(raw)
         if year_col is None:
-            first = raw.columns[0]
-            cand = pd.to_numeric(raw[first], errors="coerce")
-            if cand.between(1900, 2100).any():
-                year_col = first
-        if year_col is None:
-            return pd.DataFrame()  # sheet tutmadı -> boş dön
-
-        # 1) 4 haneli yakala
+            st.error("Ulusal veri: Yıl kolonu (year/yıl/yil/date) bulunamadı.")
+            st.stop()
+        
         y = pd.to_numeric(raw[year_col].astype(str).str.extract(r"(\d{4})")[0], errors="coerce")
-
-        # 2) yetmezse datetime dene (2020-01-01 vb.)
-        if y.notna().sum() < max(1, int(0.5*len(raw))):
-            dt = pd.to_datetime(raw[year_col], errors="coerce", dayfirst=True)
-            # 3) hâlâ yoksa Excel serial dene (43831 -> 2020)
-            if dt.notna().sum() == 0 and pd.api.types.is_numeric_dtype(raw[year_col]):
-                dt = pd.to_datetime(raw[year_col], errors="coerce", unit="D", origin="1899-12-30")
-            if dt.notna().any():
-                y = pd.to_numeric(dt.dt.year, errors="coerce")
-
         y = y.where(y.between(1900, 2100))
-
+        
         df = raw.copy()
         df["year"] = y
         df = df[df["year"].notna()].copy()
-        if df.empty:
-            return pd.DataFrame()
         df["year"] = df["year"].round().astype(int)
+
 
         # --- REGION ---
         reg_col = _find_first_match(df.columns, MAIN_SYNONYMS["region"])
